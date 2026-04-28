@@ -387,6 +387,32 @@ inline void scan_list(const float *query_vec,
     }
 }
 
+/// scan_list with tombstone filtering: skips vectors whose IDs are tombstoned.
+/// Read-only on `tombstones` so concurrent scans are safe.
+inline void scan_list_with_tombstones(const float *query_vec,
+                                      const float *list_vecs,
+                                      const int64_t *list_ids,
+                                      int list_size,
+                                      int d,
+                                      TopkBuffer &buffer,
+                                      const std::unordered_set<int64_t> &tombstones,
+                                      faiss::MetricType metric = faiss::METRIC_L2) {
+    const float *vec = list_vecs;
+    if (metric == faiss::METRIC_INNER_PRODUCT) {
+        for (int l = 0; l < list_size; l++) {
+            if (!tombstones.count(list_ids[l]))
+                buffer.add(faiss::fvec_inner_product(query_vec, vec, d), list_ids[l]);
+            vec += d;
+        }
+    } else {
+        for (int l = 0; l < list_size; l++) {
+            if (!tombstones.count(list_ids[l]))
+                buffer.add(sqrt(faiss::fvec_L2sqr(query_vec, vec, d)), list_ids[l]);
+            vec += d;
+        }
+    }
+}
+
 //inline void batched_scan_list(
 //        const float *query_vecs,
 //        const float *list_vecs,

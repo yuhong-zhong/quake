@@ -60,6 +60,9 @@ shared_ptr<BuildTimingInfo> QuakeIndex::build(Tensor x, Tensor ids, shared_ptr<I
         } else {
             parent_build_params = build_params_->parent_params;
         }
+        // Parent (centroid) indexes are loaded locally, not from S3; block mode
+        // is only meaningful behind S3 prefetch, so force it off for the parent.
+        parent_build_params->block_size = 0;
         parent_->build(clustering->centroids, clustering->partition_ids, parent_build_params);
 
         // initialize the partition manager
@@ -78,6 +81,15 @@ shared_ptr<BuildTimingInfo> QuakeIndex::build(Tensor x, Tensor ids, shared_ptr<I
         clustering->vector_ids = {ids};
 
         partition_manager_->init_partitions(parent_, clustering);
+    }
+
+    // If block_size is set, create blocks from partitions (offline, no S3).
+    if (build_params_->block_size > 0) {
+        partition_manager_->partition_store_->configure_blocks(
+            build_params_->block_size,
+            build_params_->memtable_flush_threshold,
+            metric_);
+        partition_manager_->partition_store_->create_blocks_from_partitions();
     }
 
     auto default_params = make_shared<MaintenancePolicyParams>();
@@ -239,7 +251,8 @@ void QuakeIndex::save(const std::string& dir_path) {
 void QuakeIndex::load(const std::string& dir_path, int n_workers, bool use_numa,
                       int parent_n_workers,
                       const std::string& s3_bucket, const std::string& s3_prefix,
-                      const std::string& s3_region, const std::string& s3_endpoint) {
+                      const std::string& s3_region, const std::string& s3_endpoint,
+                      int block_size, int memtable_flush_threshold) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
@@ -277,6 +290,20 @@ void QuakeIndex::load(const std::string& dir_path, int n_workers, bool use_numa,
         partition_manager_ = std::make_shared<PartitionManager>();
         std::string partitions_path = (fs::path(dir_path) / "partitions").string();
         partition_manager_->load(partitions_path, s3_bucket, s3_prefix, s3_region, s3_endpoint);
+
+        // If block mode was loaded from .blocks file, just set the metric.
+        // Otherwise, if the caller asked for block mode but no sidecar was
+        // found, refuse: enabling blocks here would leave partition_blocks_
+        // empty and silently return zero results for every query.
+        auto& ps = partition_manager_->partition_store_;
+        if (ps->s3_mode_ && ps->use_blocks_) {
+            ps->block_metric_ = metric_;
+        } else if (ps->s3_mode_ && block_size > 0) {
+            throw std::runtime_error(
+                "Block mode requested (block_size > 0) but no .blocks manifest was found "
+                "alongside the index at '" + dir_path + "'. Rebuild and save the index with "
+                "block_size > 0, or load with block_size = 0 to use per-partition S3 mode.");
+        }
     }
 
     // 3. Check if parent exists and load it

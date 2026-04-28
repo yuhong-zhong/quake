@@ -114,6 +114,8 @@ PYBIND11_MODULE(_bindings, m) {
              py::arg("parent_n_workers") = 0,
              py::arg("s3_bucket") = "", py::arg("s3_prefix") = "",
              py::arg("s3_region") = "us-east-1", py::arg("s3_endpoint") = "",
+             py::arg("block_size") = DEFAULT_BLOCK_SIZE,
+             py::arg("memtable_flush_threshold") = DEFAULT_MEMTABLE_FLUSH_THRESHOLD,
              "Load an index from a specified path.\n\n"
              "Args:\n"
              "    path (str): The path from which to load the index.\n"
@@ -123,7 +125,9 @@ PYBIND11_MODULE(_bindings, m) {
              "    s3_bucket (str, optional): S3 bucket name; enables S3 mode when non-empty.\n"
              "    s3_prefix (str, optional): S3 key prefix for partition objects.\n"
              "    s3_region (str, optional): AWS region (default = 'us-east-1').\n"
-             "    s3_endpoint (str, optional): Custom S3 endpoint URL (e.g. MinIO).")
+             "    s3_endpoint (str, optional): Custom S3 endpoint URL (e.g. MinIO).\n"
+             "    block_size (int, optional): Max vectors per block in S3 block mode.\n"
+             "    memtable_flush_threshold (int, optional): Vectors before flushing memtable to blocks.")
         .def("ntotal", &QuakeIndex::ntotal,
              "Return the total number of vectors stored in the index.")
         .def("nlist", &QuakeIndex::nlist,
@@ -166,6 +170,10 @@ PYBIND11_MODULE(_bindings, m) {
              (std::string("Batch size for GPU index building. default = ") + std::to_string(DEFAULT_GPU_BATCH_SIZE)).c_str())
         .def_readwrite("gpu_sample_size", &IndexBuildParams::gpu_sample_size,
              (std::string("Sample size for GPU index building. default = ") + std::to_string(DEFAULT_GPU_SAMPLE_SIZE)).c_str())
+        .def_readwrite("block_size", &IndexBuildParams::block_size,
+             (std::string("Max vectors per block in S3 block mode. default = ") + std::to_string(DEFAULT_BLOCK_SIZE)).c_str())
+        .def_readwrite("memtable_flush_threshold", &IndexBuildParams::memtable_flush_threshold,
+             (std::string("Vectors before flushing memtable to blocks. default = ") + std::to_string(DEFAULT_MEMTABLE_FLUSH_THRESHOLD)).c_str())
 
         .def("__repr__", [](const IndexBuildParams &p) {
             std::ostringstream oss;

@@ -814,20 +814,32 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
         // S3 initial-batch prefetch: download the first s3_prefetch_initial partitions
         // in parallel before the scan loop begins.
         bool s3_mode = partition_manager_->partition_store_->s3_mode_;
-        if (s3_mode && search_params->s3_prefetch_initial > 1) {
+        bool use_blocks = partition_manager_->partition_store_->use_blocks_;
+        if (s3_mode && search_params->s3_prefetch_initial > 0) {
             std::vector<size_t> init_pids;
             for (int p = 0; p < std::min(search_params->s3_prefetch_initial, num_parts); p++) {
                 int64_t pi = partition_ids_accessor[q][p];
                 if (pi != -1) init_pids.push_back(static_cast<size_t>(pi));
             }
-            partition_manager_->partition_store_->prefetch_partitions(init_pids);
+            if (use_blocks) {
+                // Resolve to block IDs and prefetch blocks.
+                std::vector<size_t> block_ids;
+                for (size_t pid : init_pids) {
+                    auto bit = partition_manager_->partition_store_->partition_blocks_.find(pid);
+                    if (bit != partition_manager_->partition_store_->partition_blocks_.end())
+                        block_ids.insert(block_ids.end(), bit->second.begin(), bit->second.end());
+                }
+                partition_manager_->partition_store_->prefetch_blocks(block_ids);
+            } else {
+                partition_manager_->partition_store_->prefetch_partitions(init_pids);
+            }
         }
 
         for (int p = 0; p < num_parts; p++) {
 
             // S3 lookahead prefetch: at each batch boundary beyond the initial batch,
             // download the next s3_prefetch_lookahead partitions in parallel.
-            if (s3_mode && search_params->s3_prefetch_lookahead > 1
+            if (s3_mode && search_params->s3_prefetch_lookahead > 0
                     && p >= search_params->s3_prefetch_initial
                     && (p - search_params->s3_prefetch_initial) % search_params->s3_prefetch_lookahead == 0) {
                 std::vector<size_t> ahead_pids;
@@ -836,7 +848,17 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
                     int64_t lpi = partition_ids_accessor[q][lp];
                     if (lpi != -1) ahead_pids.push_back(static_cast<size_t>(lpi));
                 }
-                partition_manager_->partition_store_->prefetch_partitions(ahead_pids);
+                if (use_blocks) {
+                    std::vector<size_t> block_ids;
+                    for (size_t pid : ahead_pids) {
+                        auto bit = partition_manager_->partition_store_->partition_blocks_.find(pid);
+                        if (bit != partition_manager_->partition_store_->partition_blocks_.end())
+                            block_ids.insert(block_ids.end(), bit->second.begin(), bit->second.end());
+                    }
+                    partition_manager_->partition_store_->prefetch_blocks(block_ids);
+                } else {
+                    partition_manager_->partition_store_->prefetch_partitions(ahead_pids);
+                }
             }
 
             auto curr_time = high_resolution_clock::now();
@@ -847,16 +869,32 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
             }
 
             start_time = high_resolution_clock::now();
-            float *list_vectors = (float *) partition_manager_->partition_store_->get_codes(pi);
-            int64_t *list_ids = (int64_t *) partition_manager_->partition_store_->get_ids(pi);
-            int64_t list_size = partition_manager_->partition_store_->list_size(pi);
-            scan_list(query_vec,
-                      list_vectors,
-                      list_ids,
-                      partition_manager_->partition_store_->list_size(pi),
-                      dimension,
-                      *topk_buf,
-                      metric_);
+            if (use_blocks) {
+                // Scan each block directly without concatenation.
+                auto block_views = partition_manager_->partition_store_->get_block_views(pi);
+                for (auto& bv : block_views) {
+                    if (bv.num_vectors == 0) continue;
+                    if (bv.tombstones && !bv.tombstones->empty()) {
+                        scan_list_with_tombstones(query_vec, bv.codes, bv.ids,
+                                                  bv.num_vectors, dimension,
+                                                  *topk_buf, *bv.tombstones, metric_);
+                    } else {
+                        scan_list(query_vec, bv.codes, bv.ids, bv.num_vectors,
+                                  dimension, *topk_buf, metric_);
+                    }
+                }
+            } else {
+                float *list_vectors = (float *) partition_manager_->partition_store_->get_codes(pi);
+                int64_t *list_ids = (int64_t *) partition_manager_->partition_store_->get_ids(pi);
+                int64_t list_size = partition_manager_->partition_store_->list_size(pi);
+                scan_list(query_vec,
+                          list_vectors,
+                          list_ids,
+                          list_size,
+                          dimension,
+                          *topk_buf,
+                          metric_);
+            }
             scanned_ids.push_back(pi);
 
             float curr_radius = topk_buf->get_kth_distance();
@@ -1002,23 +1040,25 @@ shared_ptr<SearchResult> QueryCoordinator::search(Tensor x, shared_ptr<SearchPar
         partition_ids_to_scan.masked_fill_(mask, -1);
     }
 
-    // Reset S3 per-query counters and clear any stale temp partitions
+    // Reset S3 per-query counters and clear any stale temp partitions/blocks
     partition_manager_->partition_store_->s3_load_time_ns_.store(0, std::memory_order_relaxed);
     partition_manager_->partition_store_->n_s3_downloads_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(partition_manager_->partition_store_->temp_s3_mutex_);
         partition_manager_->partition_store_->temp_s3_.clear();
+        partition_manager_->partition_store_->temp_s3_blocks_.clear();
     }
 
     auto search_result = scan_partitions(x, partition_ids_to_scan, search_params);
     search_result->timing_info->parent_info = parent_timing_info;
 
-    // Copy S3 stats into timing_info and release temp partitions
+    // Copy S3 stats into timing_info and release temp partitions/blocks
     search_result->timing_info->s3_load_time_ns = partition_manager_->partition_store_->s3_load_time_ns_.load(std::memory_order_relaxed);
     search_result->timing_info->n_s3_downloads  = partition_manager_->partition_store_->n_s3_downloads_.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(partition_manager_->partition_store_->temp_s3_mutex_);
         partition_manager_->partition_store_->temp_s3_.clear();
+        partition_manager_->partition_store_->temp_s3_blocks_.clear();
     }
 
     auto end = high_resolution_clock::now();

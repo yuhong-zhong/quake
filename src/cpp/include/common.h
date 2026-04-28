@@ -77,6 +77,8 @@ constexpr float DEFAULT_RECOMPUTE_THRESHOLD = 0.001f;    ///< Default threshold 
 constexpr int DEFAULT_APS_FLUSH_PERIOD_US = 5;         ///< Default period (in microseconds) for flushing the APS buffer.
 constexpr int DEFAULT_S3_PREFETCH_INITIAL = 1;         ///< Default number of S3 partitions to download in parallel before scanning starts.
 constexpr int DEFAULT_S3_PREFETCH_LOOKAHEAD = 1;       ///< Default number of S3 partitions to download in parallel per subsequent batch.
+constexpr int DEFAULT_BLOCK_SIZE = 1024;               ///< Default max vectors per block (S3 block layer).
+constexpr int DEFAULT_MEMTABLE_FLUSH_THRESHOLD = 8192; ///< Default vectors per partition memtable before flushing to blocks.
 
 // Default constants for maintenance policy parameters
 constexpr const char* DEFAULT_MAINTENANCE_POLICY = "query_cost"; ///< Default maintenance policy type.
@@ -141,6 +143,10 @@ struct IndexBuildParams {
     int gpu_sample_size = DEFAULT_GPU_SAMPLE_SIZE;
 
     shared_ptr<IndexBuildParams> parent_params = nullptr;
+
+    // Block layer (S3 mode)
+    int block_size = DEFAULT_BLOCK_SIZE;
+    int memtable_flush_threshold = DEFAULT_MEMTABLE_FLUSH_THRESHOLD;
 
     IndexBuildParams() = default;
 };

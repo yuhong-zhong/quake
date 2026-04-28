@@ -28,6 +28,10 @@ parser.add_argument("--s3-prefetch-initial", type=int, default=4,
                     help="Number of S3 partitions to prefetch in parallel at query start (default: 4).")
 parser.add_argument("--s3-prefetch-lookahead", type=int, default=4,
                     help="Number of S3 partitions to prefetch in parallel per subsequent batch (default: 4).")
+parser.add_argument("--block-size", type=int, default=0,
+                    help="Enable block mode with this many vectors per block (0 = legacy partition mode).")
+parser.add_argument("--memtable-flush-threshold", type=int, default=8192,
+                    help="Vectors per partition memtable before flushing to blocks (default: 8192).")
 args = parser.parse_args()
 
 # ── S3 configuration ────────────────────────────────────────────────────────
@@ -39,13 +43,13 @@ INDEX_DIR   = "quake_spacev10m.index"
 # ────────────────────────────────────────────────────────────────────────────
 
 print("Loading queries...")
-fq = open('/users/yuhong/nvme1n1/SPTAG/datasets/SPACEV1B/query.bin', 'rb')
+fq = open('/users/yuhong/sdb/SPTAG/datasets/SPACEV1B/query.bin', 'rb')
 q_count = struct.unpack('i', fq.read(4))[0]
 q_dimension = struct.unpack('i', fq.read(4))[0]
 queries = np.frombuffer(fq.read(q_count * q_dimension), dtype=np.int8).reshape((q_count, q_dimension))
 
 print("Loading truth...")
-ftruth = open('/users/yuhong/nvme1n1/quake/spacev10m_gt.bin', 'rb')
+ftruth = open('/users/yuhong/sdb/quake/spacev10m_gt.bin', 'rb')
 t_count = struct.unpack('i', ftruth.read(4))[0]
 topk = struct.unpack('i', ftruth.read(4))[0]
 truth_vids = np.frombuffer(ftruth.read(t_count * topk * 4), dtype=np.int32).reshape((t_count, topk))
@@ -53,7 +57,7 @@ truth_distances = np.frombuffer(ftruth.read(t_count * topk * 4), dtype=np.float3
 
 if not args.skip_build:
     print("Loading dataset...")
-    fdataset = open('/users/yuhong/nvme1n1/SPTAG/datasets/SPACEV1B/vectors.bin/vectors_merged.bin', 'rb')
+    fdataset = open('/users/yuhong/sdb/SPTAG/datasets/SPACEV1B/vectors.bin/vectors_merged.bin', 'rb')
     dataset_count = struct.unpack('i', fdataset.read(4))[0]
     dataset_count = min(dataset_count, 10000000)
     dataset_dimension = struct.unpack('i', fdataset.read(4))[0]
@@ -65,8 +69,10 @@ if not args.skip_build:
     # ── Phase 1: Build and save ──────────────────────────────────────────────────
     index = quake.QuakeIndex()
     build_params = quake.IndexBuildParams()
-    build_params.nlist = 1024
+    build_params.nlist = 128
     build_params.metric = "l2"
+    build_params.block_size = args.block_size
+    build_params.memtable_flush_threshold = args.memtable_flush_threshold
 
     start_time = time.time()
     index.build(vectors, ids, build_params)
@@ -79,7 +85,8 @@ if not args.skip_build:
     # ── Phase 2: Upload partitions to S3 ────────────────────────────────────────
     upload_index_to_s3(INDEX_DIR, S3_BUCKET, S3_PREFIX,
                        region=AWS_REGION,
-                       endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None)
+                       endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None,
+                       block_size=args.block_size)
 else:
     print("Skipping index build and S3 upload.")
 
@@ -89,7 +96,9 @@ s3_index.load(INDEX_DIR,
               s3_bucket=S3_BUCKET,
               s3_prefix=S3_PREFIX,
               s3_region=AWS_REGION,
-              s3_endpoint=S3_ENDPOINT)
+              s3_endpoint=S3_ENDPOINT,
+              block_size=args.block_size,
+              memtable_flush_threshold=args.memtable_flush_threshold)
 print("S3 index loaded (partition data will be fetched from S3 on demand)")
 
 # ── Phase 4: Query loop ───────────────────────────────────────────────────────
@@ -103,7 +112,7 @@ for top_K in [10, 30, 50, 100]:
     scan_ms_list = []
     n_s3_list = []
 
-    for i in range(1000):
+    for i in range(200):
         query = torch.from_numpy(queries[i].copy()).to(torch.float32).reshape(1, -1)
         search_params = quake.SearchParams()
         search_params.k = top_K

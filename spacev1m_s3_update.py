@@ -31,6 +31,10 @@ parser.add_argument("--s3-prefetch-initial", type=int, default=4,
                     help="Number of S3 partitions to prefetch at query start (default: 4).")
 parser.add_argument("--s3-prefetch-lookahead", type=int, default=4,
                     help="Number of S3 partitions to prefetch per batch (default: 4).")
+parser.add_argument("--block-size", type=int, default=0,
+                    help="Enable block mode with this many vectors per block (0 = legacy partition mode).")
+parser.add_argument("--memtable-flush-threshold", type=int, default=8192,
+                    help="Vectors per partition memtable before flushing to blocks (default: 8192).")
 args = parser.parse_args()
 
 # ── S3 configuration ────────────────────────────────────────────────────────
@@ -76,6 +80,8 @@ if not args.skip_build:
     build_params = quake.IndexBuildParams()
     build_params.nlist  = 1024
     build_params.metric = "l2"
+    build_params.block_size = args.block_size
+    build_params.memtable_flush_threshold = args.memtable_flush_threshold
 
     start_time = time.time()
     index.build(vectors, ids, build_params)
@@ -87,7 +93,8 @@ if not args.skip_build:
     # ── Phase 2: Upload partitions to S3 ────────────────────────────────────
     upload_index_to_s3(INDEX_DIR, S3_BUCKET, S3_PREFIX,
                        region=AWS_REGION,
-                       endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None)
+                       endpoint_url=S3_ENDPOINT if S3_ENDPOINT else None,
+                       block_size=args.block_size)
 else:
     print("Skipping index build and S3 upload.")
 
@@ -97,7 +104,9 @@ s3_index.load(INDEX_DIR,
               s3_bucket=S3_BUCKET,
               s3_prefix=S3_PREFIX,
               s3_region=AWS_REGION,
-              s3_endpoint=S3_ENDPOINT)
+              s3_endpoint=S3_ENDPOINT,
+              block_size=args.block_size,
+              memtable_flush_threshold=args.memtable_flush_threshold)
 print("S3 index loaded (partition data fetched from S3 on demand)")
 print("ntotal after load:", s3_index.ntotal())
 

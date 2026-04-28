@@ -363,8 +363,29 @@ shared_ptr<Clustering> PartitionManager::select_partitions(const Tensor &select_
     int d = (int) partition_store_->d_;
 
     auto selected_ids_accessor = select_ids.accessor<int64_t, 1>();
+
+    // In block mode, prefetch all blocks for selected partitions upfront.
+    if (partition_store_->use_blocks_) {
+        std::vector<size_t> all_block_ids;
+        for (int i = 0; i < select_ids.size(0); i++) {
+            size_t pid = static_cast<size_t>(selected_ids_accessor[i]);
+            auto bit = partition_store_->partition_blocks_.find(pid);
+            if (bit != partition_store_->partition_blocks_.end()) {
+                all_block_ids.insert(all_block_ids.end(),
+                                     bit->second.begin(), bit->second.end());
+            }
+        }
+        if (!all_block_ids.empty())
+            partition_store_->prefetch_blocks(all_block_ids);
+    }
+
     for (int i = 0; i < select_ids.size(0); i++) {
         int64_t list_no = selected_ids_accessor[i];
+        // In block mode, list_size() returns a tombstone-inclusive estimate until
+        // get_codes() has assembled and tombstone-filtered the partition. Skipping
+        // on the estimate is fine (estimate == 0 implies truly empty), but we
+        // *must* re-read list_size after get_codes to avoid sizing the tensor past
+        // the end of the returned buffer.
         int64_t list_size = partition_store_->list_size(list_no);
         if (list_size == 0) {
             cluster_vectors.push_back(torch::empty({0, d}, torch::kFloat32));
@@ -376,6 +397,12 @@ shared_ptr<Clustering> PartitionManager::select_partitions(const Tensor &select_
         }
         auto codes = partition_store_->get_codes(list_no);
         auto ids = partition_store_->get_ids(list_no);
+        list_size = partition_store_->list_size(list_no);
+        if (list_size == 0) {
+            cluster_vectors.push_back(torch::empty({0, d}, torch::kFloat32));
+            cluster_ids.push_back(torch::empty({0}, torch::kInt64));
+            continue;
+        }
         Tensor cluster_vectors_i = torch::from_blob((void *) codes, {list_size, d}, torch::kFloat32);
         Tensor cluster_ids_i = torch::from_blob((void *) ids, {list_size}, torch::kInt64);
         if (copy) {
@@ -477,12 +504,25 @@ void PartitionManager::refine_partitions(Tensor partition_ids, int iterations) {
 
     auto pids = partition_ids.accessor<int64_t, 1>();
 
-    // Prefetch all partitions in parallel (S3 mode), then ensure each is in partitions_.
+    // Prefetch all partitions/blocks in parallel (S3 mode), then ensure each is loaded.
     if (partition_store_->s3_mode_) {
-        std::vector<size_t> pids_vec;
-        for (int i = 0; i < partition_ids.size(0); i++)
-            pids_vec.push_back(static_cast<size_t>(pids[i]));
-        partition_store_->prefetch_partitions(pids_vec);
+        if (partition_store_->use_blocks_) {
+            std::vector<size_t> all_block_ids;
+            for (int i = 0; i < partition_ids.size(0); i++) {
+                size_t pid = static_cast<size_t>(pids[i]);
+                auto bit = partition_store_->partition_blocks_.find(pid);
+                if (bit != partition_store_->partition_blocks_.end())
+                    all_block_ids.insert(all_block_ids.end(),
+                                         bit->second.begin(), bit->second.end());
+            }
+            if (!all_block_ids.empty())
+                partition_store_->prefetch_blocks(all_block_ids);
+        } else {
+            std::vector<size_t> pids_vec;
+            for (int i = 0; i < partition_ids.size(0); i++)
+                pids_vec.push_back(static_cast<size_t>(pids[i]));
+            partition_store_->prefetch_partitions(pids_vec);
+        }
     }
     for (int i = 0; i < partition_ids.size(0); i++)
         partition_store_->ensure_partition_loaded(static_cast<size_t>(pids[i]));

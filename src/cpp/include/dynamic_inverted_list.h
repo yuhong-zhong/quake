@@ -13,6 +13,7 @@
 #include <common.h>
 #include <faiss/invlists/InvertedLists.h>
 #include <index_partition.h>
+#include <clustering.h>
 
 #ifdef QUAKE_USE_S3
 #include <aws/core/Aws.h>
@@ -57,6 +58,35 @@ namespace faiss {
         /// Per-query S3 timing accumulators (reset by QueryCoordinator before each search).
         mutable std::atomic<int64_t> s3_load_time_ns_{0};
         mutable std::atomic<int64_t> n_s3_downloads_{0};
+
+        // ── Block layer (S3 mode only) ──────────────────────────────────────
+        bool use_blocks_ = false;          ///< True when block mode is active.
+        int block_size_ = DEFAULT_BLOCK_SIZE;
+        int memtable_flush_threshold_ = DEFAULT_MEMTABLE_FLUSH_THRESHOLD;
+        size_t curr_block_id_ = 0;         ///< Next available globally-unique block ID.
+        MetricType block_metric_ = faiss::METRIC_L2; ///< Metric for intra-block clustering.
+
+        /// partition_id → list of block_ids (a block may appear in multiple partitions).
+        unordered_map<size_t, std::vector<size_t>> partition_blocks_;
+        /// block_id → num_vectors in that block.
+        unordered_map<size_t, size_t> block_num_vectors_;
+        /// block_id → reference count (number of partitions referencing this block).
+        unordered_map<size_t, int> block_refcount_;
+        /// block_id → set of tombstoned (deleted) vector IDs within that block.
+        mutable unordered_map<size_t, std::unordered_set<idx_t>> block_tombstones_;
+
+        /// Per-partition write buffer with its own mutex.
+        struct Memtable {
+            std::mutex mutex;
+            shared_ptr<IndexPartition> data;
+        };
+        mutable unordered_map<size_t, std::unique_ptr<Memtable>> memtables_;
+        mutable std::mutex memtables_map_mutex_; ///< Protects memtables_ map structure (not individual entries).
+
+        /// Per-query downloaded blocks cache; cleared before/after each search.
+        mutable unordered_map<size_t, shared_ptr<IndexPartition>> temp_s3_blocks_;
+        /// block_id → IndexPartition data (offline block storage before S3 upload).
+        unordered_map<size_t, shared_ptr<IndexPartition>> block_data_;
 
         /**
          * @brief Constructor for DynamicInvertedLists.
@@ -329,6 +359,49 @@ namespace faiss {
         void set_thread(size_t list_no, int new_thread_id);
 
         /**
+         * @brief A view of a single block's data for scanning.
+         */
+        struct BlockView {
+            const float* codes;
+            const int64_t* ids;
+            int64_t num_vectors;
+            const std::unordered_set<idx_t>* tombstones; ///< null if none
+        };
+
+        /**
+         * @brief Get per-block views for a partition (blocks must be prefetched).
+         *
+         * Returns views into prefetched block data + memtable so the caller can
+         * scan each block directly without concatenation. The caller must skip
+         * vectors whose ID appears in the tombstone set.
+         */
+        std::vector<BlockView> get_block_views(size_t list_no) const;
+
+        /**
+         * @brief Configure block layer for S3 mode.
+         */
+        void configure_blocks(int block_size, int memtable_flush_threshold, MetricType metric);
+
+        /**
+         * @brief Flush a single partition's memtable to S3 blocks (with intra-block clustering).
+         */
+        void flush_memtable(size_t pid);
+
+        /**
+         * @brief Create blocks from all in-memory partitions (offline, no S3 upload).
+         *
+         * Used during build() to pre-create block structure before saving to disk.
+         */
+        void create_blocks_from_partitions();
+
+        /**
+         * @brief Download a batch of S3 blocks in parallel.
+         *
+         * @param block_ids Block IDs to prefetch.
+         */
+        void prefetch_blocks(const std::vector<size_t>& block_ids) const;
+
+        /**
          * @brief Download a batch of S3 partitions in parallel using GetObjectAsync.
          *
          * Fetches all pids not already cached in temp_s3_ concurrently via the AWS SDK's
@@ -394,6 +467,25 @@ namespace faiss {
         std::string s3_partition_key(size_t pid) const {
             return s3_prefix_ + "/partition_" + std::to_string(pid);
         }
+
+        // ── Block layer S3 helpers ──────────────────────────────────────────
+        /// Build the S3 object key for a block.
+        std::string s3_block_key(size_t block_id) const {
+            return s3_prefix_ + "/block_" + std::to_string(block_id);
+        }
+        /// Download a single block from S3.
+        shared_ptr<IndexPartition> s3_fetch_block(size_t block_id) const;
+        /// Upload a block to S3.
+        void s3_upload_block(size_t block_id, shared_ptr<IndexPartition> part);
+        /// Delete a block from S3 (decrements refcount; deletes S3 object when refcount reaches 0).
+        void s3_release_block(size_t block_id);
+        /// Get or create the Memtable for a partition.
+        Memtable& get_or_create_memtable(size_t pid) const;
+        /// Cluster vectors into blocks; returns the new block_ids.
+        /// When upload=true, uploads each block to S3. When false, stores in block_data_.
+        std::vector<size_t> write_vectors_as_blocks(const uint8_t* codes, const idx_t* ids,
+                                                     int64_t nv, int64_t code_sz,
+                                                     bool upload = true);
 
         template<typename IdT>
         inline void map_add(IndexPartition* p, int64_t off, IdT id) noexcept {

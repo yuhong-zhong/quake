@@ -78,6 +78,19 @@ namespace faiss {
     }
 
     size_t DynamicInvertedLists::ntotal() const {
+        if (s3_mode_ && use_blocks_) {
+            // Sum of per-partition list_size(). When a partition has been
+            // assembled by get_codes(), list_size() returns the exact live
+            // count; otherwise it returns an estimate from the manifest.
+            // Shared blocks may be counted more than once across partitions.
+            size_t total = 0;
+            std::set<size_t> all_pids;
+            for (auto& [pid, _] : partition_blocks_) all_pids.insert(pid);
+            for (auto& [pid, _] : memtables_) all_pids.insert(pid);
+            for (size_t pid : all_pids)
+                total += list_size(pid);
+            return total;
+        }
         if (s3_mode_) {
             size_t ntotal = 0;
             for (auto &kv: s3_num_vectors_) {
@@ -93,6 +106,31 @@ namespace faiss {
     }
 
     size_t DynamicInvertedLists::list_size(size_t list_no) const {
+        if (s3_mode_ && use_blocks_) {
+            // If get_codes() already assembled this partition (with exact tombstone
+            // filtering), return the exact count from the assembled buffer.
+            auto pit = partitions_.find(list_no);
+            if (pit != partitions_.end())
+                return static_cast<size_t>(pit->second->num_vectors_);
+            {
+                std::lock_guard<std::mutex> lk(temp_s3_mutex_);
+                auto it = temp_s3_.find(list_no);
+                if (it != temp_s3_.end())
+                    return static_cast<size_t>(it->second->num_vectors_);
+            }
+            // Otherwise, estimation from manifest (no tombstone subtraction —
+            // tombstones are opportunistic and subtracting would undercount).
+            size_t total = 0;
+            auto bit = partition_blocks_.find(list_no);
+            if (bit != partition_blocks_.end()) {
+                for (size_t bid : bit->second)
+                    total += block_num_vectors_.at(bid);
+            }
+            auto mt_it = memtables_.find(list_no);
+            if (mt_it != memtables_.end() && mt_it->second && mt_it->second->data)
+                total += static_cast<size_t>(mt_it->second->data->num_vectors_);
+            return total;
+        }
         if (s3_mode_) {
             auto it = s3_num_vectors_.find(list_no);
             if (it == s3_num_vectors_.end()) {
@@ -109,6 +147,100 @@ namespace faiss {
     }
 
     const uint8_t *DynamicInvertedLists::get_codes(size_t list_no) const {
+        if (s3_mode_ && use_blocks_) {
+            // Mutations (split/refine) materialize full partition in partitions_.
+            auto pit = partitions_.find(list_no);
+            if (pit != partitions_.end()) return pit->second->codes_;
+
+            std::lock_guard<std::mutex> lk(temp_s3_mutex_);
+            if (temp_s3_.count(list_no)) return temp_s3_.at(list_no)->codes_;
+
+            // All blocks must have been prefetched by the caller.
+            // Collect block parts + memtable, compute upper bound on total vectors.
+            struct BlockSource {
+                shared_ptr<IndexPartition> part;
+                size_t block_id;   // SIZE_MAX for memtable (no tombstones)
+            };
+            std::vector<BlockSource> sources;
+            size_t max_nv = 0;  // upper bound for allocation
+
+            auto bit = partition_blocks_.find(list_no);
+            if (bit != partition_blocks_.end()) {
+                for (size_t bid : bit->second) {
+                    auto cache_it = temp_s3_blocks_.find(bid);
+                    if (cache_it == temp_s3_blocks_.end()) {
+                        throw std::runtime_error(
+                            "Block " + std::to_string(bid) + " for partition " +
+                            std::to_string(list_no) + " not prefetched; call prefetch_blocks first");
+                    }
+                    max_nv += static_cast<size_t>(cache_it->second->num_vectors_);
+                    sources.push_back({cache_it->second, bid});
+                }
+            }
+
+            // Include memtable data (no tombstones — removals applied directly).
+            auto mt_it = memtables_.find(list_no);
+            if (mt_it != memtables_.end() && mt_it->second && mt_it->second->data
+                && mt_it->second->data->num_vectors_ > 0) {
+                max_nv += static_cast<size_t>(mt_it->second->data->num_vectors_);
+                sources.push_back({mt_it->second->data, SIZE_MAX});
+            }
+
+            if (max_nv == 0) {
+                auto empty = std::make_shared<IndexPartition>();
+                empty->set_code_size(static_cast<int64_t>(code_size));
+                temp_s3_[list_no] = empty;
+                return empty->codes_;
+            }
+
+            // Single pass: concatenate live vectors, skip tombstoned, prune stale tombstones.
+            uint8_t* all_codes = new uint8_t[max_nv * code_size];
+            idx_t* all_ids = new idx_t[max_nv];
+            size_t offset = 0;
+            for (auto& src : sources) {
+                auto& bp = src.part;
+                if (src.block_id == SIZE_MAX) {
+                    // Memtable — no tombstones, copy all.
+                    size_t nv = static_cast<size_t>(bp->num_vectors_);
+                    std::memcpy(all_codes + offset * code_size, bp->codes_, nv * code_size);
+                    std::memcpy(all_ids + offset, bp->ids_, nv * sizeof(idx_t));
+                    offset += nv;
+                } else {
+                    auto ts_it = block_tombstones_.find(src.block_id);
+                    if (ts_it == block_tombstones_.end() || ts_it->second.empty()) {
+                        // No tombstones — bulk copy.
+                        size_t nv = static_cast<size_t>(bp->num_vectors_);
+                        std::memcpy(all_codes + offset * code_size, bp->codes_, nv * code_size);
+                        std::memcpy(all_ids + offset, bp->ids_, nv * sizeof(idx_t));
+                        offset += nv;
+                    } else {
+                        // Filter tombstoned vectors; track which tombstones actually matched.
+                        std::unordered_set<idx_t> effective;
+                        for (int64_t i = 0; i < bp->num_vectors_; i++) {
+                            if (ts_it->second.count(bp->ids_[i])) {
+                                effective.insert(bp->ids_[i]);
+                                continue;
+                            }
+                            std::memcpy(all_codes + offset * code_size,
+                                        bp->codes_ + i * code_size, code_size);
+                            all_ids[offset] = bp->ids_[i];
+                            offset++;
+                        }
+                        // Prune: keep only tombstones that matched actual vectors.
+                        ts_it->second = std::move(effective);
+                        if (ts_it->second.empty())
+                            block_tombstones_.erase(ts_it);
+                    }
+                }
+            }
+            auto combined = std::make_shared<IndexPartition>(
+                static_cast<int64_t>(offset), all_codes, all_ids,
+                static_cast<int64_t>(code_size));
+            delete[] all_codes;
+            delete[] all_ids;
+            temp_s3_[list_no] = combined;
+            return combined->codes_;
+        }
         if (s3_mode_) {
             // Check partitions_ first: mutations materialize there temporarily.
             auto pit = partitions_.find(list_no);
@@ -134,6 +266,18 @@ namespace faiss {
     }
 
     const idx_t *DynamicInvertedLists::get_ids(size_t list_no) const {
+        if (s3_mode_ && use_blocks_) {
+            auto pit = partitions_.find(list_no);
+            if (pit != partitions_.end()) return pit->second->ids_;
+
+            std::lock_guard<std::mutex> lk(temp_s3_mutex_);
+            auto it = temp_s3_.find(list_no);
+            if (it == temp_s3_.end()) {
+                throw std::runtime_error("Block-mode partition " + std::to_string(list_no) +
+                                         " not assembled; call get_codes() first");
+            }
+            return it->second->ids_;
+        }
         if (s3_mode_) {
             // Check partitions_ first: mutations materialize there temporarily.
             auto pit = partitions_.find(list_no);
@@ -355,10 +499,67 @@ namespace faiss {
     }
 
     void DynamicInvertedLists::ensure_partition_loaded(size_t pid) {
+        if (s3_mode_ && use_blocks_) {
+            if (partitions_.count(pid)) return;  // already materialized
+
+            // Prefetch blocks, assemble via get_codes(), move result to partitions_.
+            auto bit = partition_blocks_.find(pid);
+            if (bit != partition_blocks_.end() && !bit->second.empty())
+                prefetch_blocks(bit->second);
+
+            get_codes(pid);  // assembles into temp_s3_[pid] (includes memtable data)
+
+            // Move from temp cache to partitions_ so mutations can modify it.
+            {
+                std::lock_guard<std::mutex> lk(temp_s3_mutex_);
+                auto it = temp_s3_.find(pid);
+                if (it != temp_s3_.end()) {
+                    partitions_[pid] = std::move(it->second);
+                    temp_s3_.erase(it);
+                }
+            }
+            // The memtable's vectors are now folded into partitions_[pid]. Clear
+            // it so the subsequent flush_partition doesn't re-flush them as a
+            // duplicate set of blocks.
+            {
+                std::lock_guard<std::mutex> map_lk(memtables_map_mutex_);
+                auto mt_it = memtables_.find(pid);
+                if (mt_it != memtables_.end() && mt_it->second) {
+                    std::lock_guard<std::mutex> mt_lk(mt_it->second->mutex);
+                    mt_it->second->data = std::make_shared<IndexPartition>();
+                    mt_it->second->data->set_code_size(static_cast<int64_t>(code_size));
+                }
+            }
+            return;
+        }
         if (s3_mode_) s3_ensure_partition_loaded(pid);
     }
 
     void DynamicInvertedLists::flush_partition(size_t pid) {
+        if (s3_mode_ && use_blocks_) {
+            // Delete old blocks for this partition.
+            auto bit = partition_blocks_.find(pid);
+            if (bit != partition_blocks_.end()) {
+                for (size_t bid : bit->second) s3_release_block(bid);
+                bit->second.clear();
+            }
+            // Write materialized partition data as new blocks (with clustering).
+            auto pit = partitions_.find(pid);
+            if (pit != partitions_.end() && pit->second && pit->second->num_vectors_ > 0) {
+                auto& part = pit->second;
+                auto new_bids = write_vectors_as_blocks(
+                    part->codes_, part->ids_, part->num_vectors_,
+                    static_cast<int64_t>(code_size));
+                partition_blocks_[pid] = std::move(new_bids);
+            }
+            // Also flush memtable if any.
+            auto mt_it = memtables_.find(pid);
+            if (mt_it != memtables_.end() && mt_it->second && mt_it->second->data
+                && mt_it->second->data->num_vectors_ > 0) {
+                flush_memtable(pid);
+            }
+            return;
+        }
         if (s3_mode_) s3_upload_partition(pid);
     }
 
@@ -366,10 +567,362 @@ namespace faiss {
         if (s3_mode_) s3_evict_partition(pid);
     }
 
+    // ── Block layer implementation ──────────────────────────────────────────
+
+    std::vector<DynamicInvertedLists::BlockView> DynamicInvertedLists::get_block_views(size_t list_no) const {
+        std::vector<BlockView> views;
+
+        auto bit = partition_blocks_.find(list_no);
+        if (bit != partition_blocks_.end()) {
+            std::lock_guard<std::mutex> lk(temp_s3_mutex_);
+            for (size_t bid : bit->second) {
+                auto cache_it = temp_s3_blocks_.find(bid);
+                if (cache_it == temp_s3_blocks_.end()) {
+                    throw std::runtime_error(
+                        "Block " + std::to_string(bid) + " for partition " +
+                        std::to_string(list_no) + " not prefetched");
+                }
+                auto& bp = cache_it->second;
+                const std::unordered_set<idx_t>* ts = nullptr;
+                auto ts_it = block_tombstones_.find(bid);
+                if (ts_it != block_tombstones_.end() && !ts_it->second.empty())
+                    ts = &ts_it->second;
+                views.push_back({
+                    reinterpret_cast<const float*>(bp->codes_),
+                    bp->ids_,
+                    bp->num_vectors_,
+                    ts
+                });
+            }
+        }
+
+        // Include memtable.
+        auto mt_it = memtables_.find(list_no);
+        if (mt_it != memtables_.end() && mt_it->second && mt_it->second->data
+            && mt_it->second->data->num_vectors_ > 0) {
+            auto& d = mt_it->second->data;
+            views.push_back({
+                reinterpret_cast<const float*>(d->codes_),
+                d->ids_,
+                d->num_vectors_,
+                nullptr
+            });
+        }
+
+        return views;
+    }
+
+    void DynamicInvertedLists::configure_blocks(int block_size, int memtable_flush_threshold, MetricType metric) {
+        if (block_size <= 0)
+            throw std::invalid_argument("configure_blocks: block_size must be > 0 (got " +
+                                        std::to_string(block_size) + ")");
+        if (memtable_flush_threshold <= 0)
+            throw std::invalid_argument("configure_blocks: memtable_flush_threshold must be > 0 (got " +
+                                        std::to_string(memtable_flush_threshold) + ")");
+        use_blocks_ = true;
+        block_size_ = block_size;
+        memtable_flush_threshold_ = memtable_flush_threshold;
+        block_metric_ = metric;
+    }
+
+    DynamicInvertedLists::Memtable& DynamicInvertedLists::get_or_create_memtable(size_t pid) const {
+        std::lock_guard<std::mutex> lk(memtables_map_mutex_);
+        auto it = memtables_.find(pid);
+        if (it == memtables_.end()) {
+            auto mt = std::make_unique<Memtable>();
+            mt->data = std::make_shared<IndexPartition>();
+            mt->data->set_code_size(static_cast<int64_t>(code_size));
+            auto [inserted_it, _] = memtables_.emplace(pid, std::move(mt));
+            return *inserted_it->second;
+        }
+        return *it->second;
+    }
+
+    shared_ptr<IndexPartition> DynamicInvertedLists::s3_fetch_block(size_t block_id) const {
+#ifdef QUAKE_USE_S3
+        string key = s3_block_key(block_id);
+        Aws::S3::Model::GetObjectRequest req;
+        req.SetBucket(s3_bucket_);
+        req.SetKey(key);
+        auto outcome = s3_client_->GetObject(req);
+        if (!outcome.IsSuccess()) {
+            throw std::runtime_error(
+                "S3 GetObject failed for block key=" + key + ": " +
+                outcome.GetError().GetMessage().c_str());
+        }
+        auto& body = outcome.GetResult().GetBody();
+        size_t nv = block_num_vectors_.at(block_id);
+        size_t csize = nv * static_cast<size_t>(code_size);
+        size_t isize = nv * sizeof(idx_t);
+        uint8_t *codes = new uint8_t[csize];
+        idx_t   *ids   = new idx_t[nv];
+        body.read(reinterpret_cast<char*>(codes), csize);
+        body.read(reinterpret_cast<char*>(ids),   isize);
+        auto part = std::make_shared<IndexPartition>(
+            static_cast<int64_t>(nv), codes, ids, static_cast<int64_t>(code_size));
+        delete[] codes;
+        delete[] ids;
+        return part;
+#else
+        throw std::runtime_error("Quake was built without S3 support (QUAKE_USE_S3 not set).");
+#endif
+    }
+
+    void DynamicInvertedLists::s3_upload_block(size_t block_id, shared_ptr<IndexPartition> part) {
+#ifdef QUAKE_USE_S3
+        size_t nv    = static_cast<size_t>(part->num_vectors_);
+        size_t csize = nv * static_cast<size_t>(code_size);
+        size_t isize = nv * sizeof(idx_t);
+
+        auto ss = Aws::MakeShared<Aws::StringStream>("quake-s3-block-upload");
+        if (nv > 0) {
+            ss->write(reinterpret_cast<const char*>(part->codes_), csize);
+            ss->write(reinterpret_cast<const char*>(part->ids_),   isize);
+        }
+
+        std::string key = s3_block_key(block_id);
+        Aws::S3::Model::PutObjectRequest req;
+        req.SetBucket(s3_bucket_);
+        req.SetKey(key);
+        req.SetBody(ss);
+        req.SetContentLength(static_cast<long long>(csize + isize));
+
+        auto outcome = s3_client_->PutObject(req);
+        if (!outcome.IsSuccess()) {
+            throw std::runtime_error(
+                "S3 PutObject failed for block key=" + key + ": " +
+                outcome.GetError().GetMessage().c_str());
+        }
+        block_num_vectors_[block_id] = nv;
+#else
+        throw std::runtime_error("Quake was built without S3 support (QUAKE_USE_S3 not set).");
+#endif
+    }
+
+    void DynamicInvertedLists::s3_release_block(size_t block_id) {
+        auto rc_it = block_refcount_.find(block_id);
+        if (rc_it != block_refcount_.end()) {
+            rc_it->second--;
+            if (rc_it->second > 0) return;  // still referenced by other partitions
+            block_refcount_.erase(rc_it);
+        }
+#ifdef QUAKE_USE_S3
+        std::string key = s3_block_key(block_id);
+        Aws::S3::Model::DeleteObjectRequest req;
+        req.SetBucket(s3_bucket_);
+        req.SetKey(key);
+        auto outcome = s3_client_->DeleteObject(req);
+        if (!outcome.IsSuccess()) {
+            throw std::runtime_error(
+                "S3 DeleteObject failed for block key=" + key + ": " +
+                outcome.GetError().GetMessage().c_str());
+        }
+#endif
+        block_num_vectors_.erase(block_id);
+    }
+
+    void DynamicInvertedLists::prefetch_blocks(const std::vector<size_t>& block_ids) const {
+        if (!s3_mode_ || !use_blocks_ || block_ids.empty()) return;
+#ifdef QUAKE_USE_S3
+        // Filter to blocks not yet cached.
+        std::vector<size_t> to_fetch;
+        {
+            std::lock_guard<std::mutex> lk(temp_s3_mutex_);
+            for (size_t bid : block_ids)
+                if (!temp_s3_blocks_.count(bid)) to_fetch.push_back(bid);
+        }
+        if (to_fetch.empty()) return;
+
+        const size_t n = to_fetch.size();
+        std::vector<std::shared_ptr<IndexPartition>> results(n);
+        std::atomic<size_t> n_done{0};
+        std::mutex wait_mutex;
+        std::condition_variable wait_cv;
+
+        auto wall_t0 = high_resolution_clock::now();
+
+        for (size_t i = 0; i < n; i++) {
+            size_t bid = to_fetch[i];
+            size_t nv = block_num_vectors_.at(bid);
+            size_t csize = nv * static_cast<size_t>(code_size);
+            size_t isize = nv * sizeof(idx_t);
+            int64_t cs = static_cast<int64_t>(code_size);
+
+            Aws::S3::Model::GetObjectRequest req;
+            req.SetBucket(s3_bucket_);
+            req.SetKey(s3_block_key(bid));
+
+            s3_client_->GetObjectAsync(req,
+                [i, nv, csize, isize, cs, n, &results, &n_done, &wait_mutex, &wait_cv]
+                (const Aws::S3::S3Client*,
+                 const Aws::S3::Model::GetObjectRequest&,
+                 Aws::S3::Model::GetObjectOutcome outcome,
+                 const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) {
+                    if (outcome.IsSuccess()) {
+                        auto& body = outcome.GetResult().GetBody();
+                        uint8_t* codes = new uint8_t[csize];
+                        idx_t*   ids   = new idx_t[nv];
+                        body.read(reinterpret_cast<char*>(codes), csize);
+                        body.read(reinterpret_cast<char*>(ids),   isize);
+                        results[i] = std::make_shared<IndexPartition>(
+                            static_cast<int64_t>(nv), codes, ids, cs);
+                        delete[] codes;
+                        delete[] ids;
+                    }
+                    if (n_done.fetch_add(1, std::memory_order_acq_rel) + 1 == n) {
+                        std::lock_guard<std::mutex> lk(wait_mutex);
+                        wait_cv.notify_one();
+                    }
+                }, nullptr);
+        }
+
+        {
+            std::unique_lock<std::mutex> lk(wait_mutex);
+            wait_cv.wait(lk, [&n_done, n] {
+                return n_done.load(std::memory_order_acquire) == n;
+            });
+        }
+
+        int64_t elapsed = duration_cast<nanoseconds>(
+            high_resolution_clock::now() - wall_t0).count();
+
+        {
+            std::lock_guard<std::mutex> lk(temp_s3_mutex_);
+            for (size_t i = 0; i < n; i++) {
+                if (results[i] && !temp_s3_blocks_.count(to_fetch[i]))
+                    temp_s3_blocks_[to_fetch[i]] = results[i];
+            }
+        }
+        s3_load_time_ns_.fetch_add(elapsed, std::memory_order_relaxed);
+        n_s3_downloads_.fetch_add(static_cast<int64_t>(n), std::memory_order_relaxed);
+#endif
+    }
+
+    std::vector<size_t> DynamicInvertedLists::write_vectors_as_blocks(
+            const uint8_t* codes, const idx_t* ids, int64_t nv, int64_t code_sz,
+            bool upload) {
+        std::vector<size_t> new_block_ids;
+        if (nv == 0) return new_block_ids;
+
+        int n_blocks = static_cast<int>(
+            (nv + block_size_ - 1) / block_size_);
+
+        // Helper: store a block either to S3 or in-memory block_data_.
+        auto store_block = [&](size_t bid, shared_ptr<IndexPartition> part, int64_t nv_block) {
+            if (upload) {
+                s3_upload_block(bid, part);
+            } else {
+                block_data_[bid] = part;
+                block_num_vectors_[bid] = static_cast<size_t>(nv_block);
+            }
+            block_refcount_[bid] = 1;
+            new_block_ids.push_back(bid);
+        };
+
+        if (n_blocks <= 1) {
+            // Single block — no clustering needed.
+            size_t bid = curr_block_id_++;
+            auto part = std::make_shared<IndexPartition>(nv, const_cast<uint8_t*>(codes),
+                                                          const_cast<idx_t*>(ids), code_sz);
+            store_block(bid, part, nv);
+        } else {
+            // Cluster vectors into n_blocks groups so each block is spatially coherent.
+            Tensor vec_tensor = torch::from_blob(
+                const_cast<uint8_t*>(codes),
+                {nv, code_sz / static_cast<int64_t>(sizeof(float))},
+                torch::kFloat32).clone();
+            Tensor id_tensor = torch::from_blob(
+                const_cast<idx_t*>(ids),
+                {nv},
+                torch::kInt64).clone();
+
+            auto build_params = std::make_shared<IndexBuildParams>();
+            build_params->nlist = n_blocks;
+            build_params->niter = 3;
+            build_params->metric = (block_metric_ == faiss::METRIC_L2) ? "l2" : "ip";
+
+            auto clustering = kmeans_cpu(vec_tensor, id_tensor, build_params);
+
+            for (int c = 0; c < clustering->nlist(); c++) {
+                if (!clustering->vectors[c].defined() || clustering->vectors[c].size(0) == 0)
+                    continue;
+                int64_t cnv = clustering->vectors[c].size(0);
+                const uint8_t* ccodes = reinterpret_cast<const uint8_t*>(
+                    clustering->vectors[c].contiguous().data_ptr<float>());
+                const idx_t* cids = clustering->vector_ids[c].contiguous().data_ptr<int64_t>();
+
+                size_t bid = curr_block_id_++;
+                auto part = std::make_shared<IndexPartition>(cnv,
+                    const_cast<uint8_t*>(ccodes), const_cast<idx_t*>(cids), code_sz);
+                store_block(bid, part, cnv);
+            }
+        }
+        return new_block_ids;
+    }
+
+    void DynamicInvertedLists::create_blocks_from_partitions() {
+        for (auto& [pid, part] : partitions_) {
+            if (!part || part->num_vectors_ == 0) {
+                partition_blocks_[pid] = {};
+                continue;
+            }
+            auto bids = write_vectors_as_blocks(
+                part->codes_, part->ids_, part->num_vectors_,
+                static_cast<int64_t>(code_size), /*upload=*/false);
+            partition_blocks_[pid] = std::move(bids);
+        }
+    }
+
+    void DynamicInvertedLists::flush_memtable(size_t pid) {
+        auto mt_it = memtables_.find(pid);
+        if (mt_it == memtables_.end()) return;
+        auto& mt = *mt_it->second;
+
+        // Swap data out under the lock so concurrent writers can continue.
+        shared_ptr<IndexPartition> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(mt.mutex);
+            if (!mt.data || mt.data->num_vectors_ == 0) return;
+            snapshot = mt.data;
+            mt.data = std::make_shared<IndexPartition>();
+            mt.data->set_code_size(static_cast<int64_t>(code_size));
+        }
+
+        // Flush outside the lock — S3 upload + clustering can be slow.
+        auto new_block_ids = write_vectors_as_blocks(
+            snapshot->codes_, snapshot->ids_,
+            snapshot->num_vectors_, static_cast<int64_t>(code_size));
+
+        auto& pblocks = partition_blocks_[pid];
+        pblocks.insert(pblocks.end(), new_block_ids.begin(), new_block_ids.end());
+    }
+
     // ────────────────────────────────────────────────────────────────────────
 
     void DynamicInvertedLists::remove_entry(size_t list_no, idx_t id) {
-        if (s3_mode_) s3_ensure_partition_loaded(list_no);
+        if (s3_mode_ && use_blocks_) {
+            // Try memtable first.
+            auto mt_it = memtables_.find(list_no);
+            if (mt_it != memtables_.end() && mt_it->second && mt_it->second->data) {
+                std::lock_guard<std::mutex> lk(mt_it->second->mutex);
+                int64_t pos = mt_it->second->data->find_id(id);
+                if (pos != -1) {
+                    mt_it->second->data->remove(pos);
+                    return;
+                }
+            }
+            // Not in memtable — add tombstone to the appropriate block.
+            auto bit = partition_blocks_.find(list_no);
+            if (bit != partition_blocks_.end()) {
+                for (size_t bid : bit->second) {
+                    block_tombstones_[bid].insert(id);
+                    // We don't know which block has it, so we just mark across all.
+                    // The tombstone is a no-op during scan if the id isn't in that block.
+                }
+            }
+            return;
+        }
+        if (s3_mode_) ensure_partition_loaded(list_no);
         auto it = partitions_.find(list_no);
         if (it == partitions_.end()) {
             string err_message = "List " + std::to_string(list_no) + " does not exist in remove_entry";
@@ -389,13 +942,39 @@ namespace faiss {
             modified = true;
         }
         if (s3_mode_) {
-            if (modified) s3_upload_partition(list_no);
-            s3_evict_partition(list_no);
+            if (modified) flush_partition(list_no);
+            evict_partition(list_no);
         }
     }
 
     void DynamicInvertedLists::remove_entries_from_partition(size_t list_no, vector<idx_t> vectors_to_remove) {
-        if (s3_mode_) s3_ensure_partition_loaded(list_no);
+        if (s3_mode_ && use_blocks_) {
+            // Try memtable first, tombstone the rest.
+            std::set<idx_t> remaining(vectors_to_remove.begin(), vectors_to_remove.end());
+            auto mt_it = memtables_.find(list_no);
+            if (mt_it != memtables_.end() && mt_it->second && mt_it->second->data) {
+                std::lock_guard<std::mutex> lk(mt_it->second->mutex);
+                for (int64_t i = 0; i < mt_it->second->data->num_vectors_;) {
+                    if (remaining.count(mt_it->second->data->ids_[i])) {
+                        idx_t victim = mt_it->second->data->ids_[i];
+                        mt_it->second->data->remove(i);
+                        remaining.erase(victim);
+                    } else {
+                        i++;
+                    }
+                }
+            }
+            // Tombstone remaining in all blocks of this partition.
+            auto bit = partition_blocks_.find(list_no);
+            if (bit != partition_blocks_.end()) {
+                for (size_t bid : bit->second) {
+                    for (idx_t id : remaining)
+                        block_tombstones_[bid].insert(id);
+                }
+            }
+            return;
+        }
+        if (s3_mode_) ensure_partition_loaded(list_no);
         auto it = partitions_.find(list_no);
         if (it == partitions_.end()) {
             string err_message = "List " + std::to_string(list_no) + " does not exist in remove_entries_from_partition";
@@ -419,10 +998,38 @@ namespace faiss {
                 i++;
             }
         }
-        if (s3_mode_) { s3_upload_partition(list_no); s3_evict_partition(list_no); }
+        if (s3_mode_) { flush_partition(list_no); evict_partition(list_no); }
     }
 
     void DynamicInvertedLists::remove_vectors(std::set<idx_t> vectors_to_remove) {
+        if (s3_mode_ && use_blocks_) {
+            // Try removing from memtables first; remainder becomes tombstones.
+            std::set<idx_t> remaining = vectors_to_remove;
+            for (auto& [pid, mt_ptr] : memtables_) {
+                if (remaining.empty()) break;
+                if (!mt_ptr || !mt_ptr->data) continue;
+                std::lock_guard<std::mutex> lk(mt_ptr->mutex);
+                for (int64_t i = 0; i < mt_ptr->data->num_vectors_;) {
+                    if (remaining.count(mt_ptr->data->ids_[i])) {
+                        idx_t victim = mt_ptr->data->ids_[i];
+                        mt_ptr->data->remove(i);
+                        remaining.erase(victim);
+                    } else {
+                        i++;
+                    }
+                }
+            }
+            // Tombstone remaining IDs across all blocks in all partitions.
+            for (auto& [pid, block_ids] : partition_blocks_) {
+                if (remaining.empty()) break;
+                for (size_t bid : block_ids) {
+                    for (idx_t id : remaining) {
+                        block_tombstones_[bid].insert(id);
+                    }
+                }
+            }
+            return;
+        }
         if (s3_mode_) {
             // Stream one partition at a time to bound memory usage.
             // Early exit once all target IDs have been found.
@@ -489,6 +1096,22 @@ namespace faiss {
         const uint8_t *codes) {
         if (n_entry == 0) return 0;
 
+        // Block mode: buffer in memtable, flush when threshold reached.
+        if (s3_mode_ && use_blocks_) {
+            bool needs_flush = false;
+            {
+                auto& mt = get_or_create_memtable(list_no);
+                std::lock_guard<std::mutex> lk(mt.mutex);
+                mt.data->append(static_cast<int64_t>(n_entry), ids, codes);
+                needs_flush = (mt.data->num_vectors_ >= memtable_flush_threshold_);
+            }
+            // Flush outside the lock — flush_memtable does S3 I/O and clustering.
+            if (needs_flush) {
+                flush_memtable(list_no);
+            }
+            return n_entry;
+        }
+
         if (s3_mode_) s3_ensure_partition_loaded(list_no);
 
         auto it = partitions_.find(list_no);
@@ -517,6 +1140,9 @@ namespace faiss {
         size_t n_entry,
         const idx_t *ids,
         const uint8_t *codes) {
+        if (s3_mode_ && use_blocks_) {
+            throw std::runtime_error("update_entries is not supported in block mode");
+        }
         auto it = partitions_.find(list_no);
         if (it == partitions_.end()) {
             string err_message = "List " + std::to_string(list_no) + " does not exist in update_entries";
@@ -534,6 +1160,9 @@ void DynamicInvertedLists::batch_update_entries(
     int64_t* new_ids,
     int num)
 {
+    if (s3_mode_ && use_blocks_) {
+        throw std::runtime_error("batch_update_entries is not supported in block mode");
+    }
     /* 1. gather indices to move grouped by their *destination* */
     std::unordered_map<size_t, std::vector<int>> to_move;
     for (int i = 0; i < num; ++i) {
@@ -610,6 +1239,19 @@ void DynamicInvertedLists::batch_update_entries(
 }
 
     void DynamicInvertedLists::remove_list(size_t list_no) {
+        if (s3_mode_ && use_blocks_) {
+            // Release all blocks belonging to this partition (respects refcount).
+            auto bit = partition_blocks_.find(list_no);
+            if (bit != partition_blocks_.end()) {
+                for (size_t bid : bit->second) s3_release_block(bid);
+                partition_blocks_.erase(bit);
+            }
+            memtables_.erase(list_no);
+            partitions_.erase(list_no);
+            { std::lock_guard<std::mutex> lk(temp_s3_mutex_); temp_s3_.erase(list_no); }
+            nlist--;
+            return;
+        }
         if (s3_mode_) {
             partitions_.erase(list_no);  // evict if materialized (id_to_location_ not used)
             { std::lock_guard<std::mutex> lk(temp_s3_mutex_); temp_s3_.erase(list_no); }
@@ -630,6 +1272,15 @@ void DynamicInvertedLists::batch_update_entries(
     }
 
     void DynamicInvertedLists::add_list(size_t list_no) {
+        if (s3_mode_ && use_blocks_) {
+            if (partition_blocks_.count(list_no)) {
+                throw std::runtime_error("List " + std::to_string(list_no) +
+                                         " already exists in partition_blocks_ in add_list");
+            }
+            partition_blocks_[list_no] = {};  // empty block list
+            nlist++;
+            return;
+        }
         if (partitions_.find(list_no) != partitions_.end()) {
             string err_message = "List " + std::to_string(list_no) + " already exists in add_list";
             throw std::runtime_error(err_message);
@@ -726,6 +1377,16 @@ void DynamicInvertedLists::batch_update_entries(
         id_to_location_.clear();
         nlist = 0;
         curr_list_id_ = 0;
+        // Block layer state
+        partition_blocks_.clear();
+        block_num_vectors_.clear();
+        block_refcount_.clear();
+        block_tombstones_.clear();
+        memtables_.clear();
+        temp_s3_blocks_.clear();
+        block_data_.clear();
+        curr_block_id_ = 0;
+        use_blocks_ = false;
     }
 
     void DynamicInvertedLists::resize(size_t nlist, size_t code_size) {
@@ -734,6 +1395,149 @@ void DynamicInvertedLists::batch_update_entries(
     }
 
     void DynamicInvertedLists::save(const string &filename) {
+        // Remove any stale .blocks sidecar if we are not writing block mode —
+        // otherwise a subsequent load would detect it and incorrectly enable
+        // block mode (clobbering s3_num_vectors_, zeroing ntotal).
+        if (!use_blocks_) {
+            std::string stale_blocks = filename + ".blocks";
+            std::remove(stale_blocks.c_str());
+        }
+        if (use_blocks_) {
+            // Block mode: write block manifest + memtable data to companion file.
+            std::string blocks_file = filename + ".blocks";
+            std::ofstream ofs(blocks_file, std::ios::binary);
+            if (!ofs.is_open())
+                throw std::runtime_error("Could not open file for writing: " + blocks_file);
+
+            // Header: magic, version, curr_block_id, block_size, memtable_flush_threshold,
+            //         metric, code_size, nlist, num_block_entries, num_partition_entries
+            ofs.write(reinterpret_cast<const char*>(&SerializationMagicNumber), sizeof(uint32_t));
+            uint32_t version = 1;  // block manifest version
+            ofs.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
+            uint64_t cbi = curr_block_id_;
+            ofs.write(reinterpret_cast<const char*>(&cbi), sizeof(uint64_t));
+            uint64_t bs = block_size_, mft = memtable_flush_threshold_;
+            ofs.write(reinterpret_cast<const char*>(&bs), sizeof(uint64_t));
+            ofs.write(reinterpret_cast<const char*>(&mft), sizeof(uint64_t));
+            uint64_t metric_val = static_cast<uint64_t>(block_metric_);
+            ofs.write(reinterpret_cast<const char*>(&metric_val), sizeof(uint64_t));
+            uint64_t cs64 = code_size;
+            ofs.write(reinterpret_cast<const char*>(&cs64), sizeof(uint64_t));
+            uint64_t nlist64 = nlist;
+            ofs.write(reinterpret_cast<const char*>(&nlist64), sizeof(uint64_t));
+
+            // Block num_vectors entries: count, then (block_id, num_vectors) pairs.
+            uint64_t n_blocks = block_num_vectors_.size();
+            ofs.write(reinterpret_cast<const char*>(&n_blocks), sizeof(uint64_t));
+            for (auto& [bid, nv] : block_num_vectors_) {
+                uint64_t b = bid, v = nv;
+                ofs.write(reinterpret_cast<const char*>(&b), sizeof(uint64_t));
+                ofs.write(reinterpret_cast<const char*>(&v), sizeof(uint64_t));
+            }
+
+            // Block refcount entries: count, then (block_id, refcount) pairs.
+            uint64_t n_refcounts = block_refcount_.size();
+            ofs.write(reinterpret_cast<const char*>(&n_refcounts), sizeof(uint64_t));
+            for (auto& [bid, rc] : block_refcount_) {
+                uint64_t b = bid;
+                int64_t r = rc;
+                ofs.write(reinterpret_cast<const char*>(&b), sizeof(uint64_t));
+                ofs.write(reinterpret_cast<const char*>(&r), sizeof(int64_t));
+            }
+
+            // Block tombstones: count of blocks with tombstones,
+            // then for each: block_id, num_tombstones, tombstone_ids.
+            uint64_t n_ts_blocks = block_tombstones_.size();
+            ofs.write(reinterpret_cast<const char*>(&n_ts_blocks), sizeof(uint64_t));
+            for (auto& [bid, ts_set] : block_tombstones_) {
+                uint64_t b = bid;
+                uint64_t n_ts = ts_set.size();
+                ofs.write(reinterpret_cast<const char*>(&b), sizeof(uint64_t));
+                ofs.write(reinterpret_cast<const char*>(&n_ts), sizeof(uint64_t));
+                for (idx_t id : ts_set)
+                    ofs.write(reinterpret_cast<const char*>(&id), sizeof(idx_t));
+            }
+
+            // Partition→blocks mapping: for each partition, pid, num_blocks, block_ids.
+            // Collect all partition IDs from partition_blocks_ and any with memtables.
+            std::set<size_t> all_pids;
+            for (auto& [pid, _] : partition_blocks_) all_pids.insert(pid);
+            for (auto& [pid, _] : memtables_) all_pids.insert(pid);
+
+            uint64_t n_parts = all_pids.size();
+            ofs.write(reinterpret_cast<const char*>(&n_parts), sizeof(uint64_t));
+
+            for (size_t pid : all_pids) {
+                uint64_t p = pid;
+                ofs.write(reinterpret_cast<const char*>(&p), sizeof(uint64_t));
+
+                auto bit = partition_blocks_.find(pid);
+                uint64_t nb = (bit != partition_blocks_.end()) ? bit->second.size() : 0;
+                ofs.write(reinterpret_cast<const char*>(&nb), sizeof(uint64_t));
+                if (bit != partition_blocks_.end()) {
+                    for (size_t bid : bit->second) {
+                        uint64_t b = bid;
+                        ofs.write(reinterpret_cast<const char*>(&b), sizeof(uint64_t));
+                    }
+                }
+
+                // Write memtable data (codes + ids).
+                auto mt_it = memtables_.find(pid);
+                bool has_mt = (mt_it != memtables_.end() && mt_it->second &&
+                               mt_it->second->data && mt_it->second->data->num_vectors_ > 0);
+                uint64_t mt_nv = has_mt ? static_cast<uint64_t>(mt_it->second->data->num_vectors_) : 0;
+                ofs.write(reinterpret_cast<const char*>(&mt_nv), sizeof(uint64_t));
+                if (has_mt) {
+                    auto& d = mt_it->second->data;
+                    ofs.write(reinterpret_cast<const char*>(d->codes_),
+                              mt_nv * code_size);
+                    ofs.write(reinterpret_cast<const char*>(d->ids_),
+                              mt_nv * sizeof(idx_t));
+                }
+            }
+
+            // Block vector data section: write block contents from block_data_.
+            // This section is present when blocks were created offline (not yet uploaded to S3).
+            {
+                uint64_t n_data_blocks = block_data_.size();
+                ofs.write(reinterpret_cast<const char*>(&n_data_blocks), sizeof(uint64_t));
+                for (auto& [bid, part] : block_data_) {
+                    uint64_t b = bid;
+                    uint64_t nv = static_cast<uint64_t>(part->num_vectors_);
+                    ofs.write(reinterpret_cast<const char*>(&b), sizeof(uint64_t));
+                    ofs.write(reinterpret_cast<const char*>(&nv), sizeof(uint64_t));
+                    if (nv > 0) {
+                        ofs.write(reinterpret_cast<const char*>(part->codes_),
+                                  nv * code_size);
+                        ofs.write(reinterpret_cast<const char*>(part->ids_),
+                                  nv * sizeof(idx_t));
+                    }
+                }
+            }
+
+            ofs.close();
+
+            // Also write a minimal stub partitions file so load() can read the header.
+            {
+                std::ofstream stub(filename, std::ios::binary);
+                if (!stub.is_open())
+                    throw std::runtime_error("Could not open file for writing: " + filename);
+                stub.write(reinterpret_cast<const char*>(&SerializationMagicNumber), sizeof(uint32_t));
+                stub.write(reinterpret_cast<const char*>(&SerializationVersion), sizeof(uint32_t));
+                uint64_t nlist_64 = static_cast<uint64_t>(nlist);
+                uint64_t cs_64 = static_cast<uint64_t>(code_size);
+                uint64_t np = 0;  // zero partitions in the stub
+                stub.write(reinterpret_cast<const char*>(&nlist_64), sizeof(uint64_t));
+                stub.write(reinterpret_cast<const char*>(&cs_64), sizeof(uint64_t));
+                stub.write(reinterpret_cast<const char*>(&np), sizeof(uint64_t));
+                // Empty offsets array (just one entry: 0).
+                uint64_t zero = 0;
+                stub.write(reinterpret_cast<const char*>(&zero), sizeof(uint64_t));
+                stub.close();
+            }
+            return;
+        }
+
         if (s3_mode_) {
             // S3 mode: write a manifest-only file (no chunk data).
             // Offsets are derived from s3_num_vectors_ so that metadata_only load
@@ -958,6 +1762,141 @@ void DynamicInvertedLists::batch_update_entries(
             s3_bucket_ = s3_bucket;
             s3_prefix_ = s3_prefix;
             s3_mode_ = true;
+
+            // Check for block manifest companion file.
+            std::string blocks_file = filename + ".blocks";
+            std::ifstream bifs(blocks_file, std::ios::binary);
+            if (bifs.is_open()) {
+                uint32_t b_magic, b_version;
+                bifs.read(reinterpret_cast<char*>(&b_magic), sizeof(uint32_t));
+                bifs.read(reinterpret_cast<char*>(&b_version), sizeof(uint32_t));
+                if (b_magic != SerializationMagicNumber)
+                    throw std::runtime_error("Invalid block manifest magic number.");
+
+                uint64_t cbi, bs, mft, metric_val, cs64, nlist64;
+                bifs.read(reinterpret_cast<char*>(&cbi), sizeof(uint64_t));
+                bifs.read(reinterpret_cast<char*>(&bs), sizeof(uint64_t));
+                bifs.read(reinterpret_cast<char*>(&mft), sizeof(uint64_t));
+                bifs.read(reinterpret_cast<char*>(&metric_val), sizeof(uint64_t));
+                bifs.read(reinterpret_cast<char*>(&cs64), sizeof(uint64_t));
+                bifs.read(reinterpret_cast<char*>(&nlist64), sizeof(uint64_t));
+
+                curr_block_id_ = static_cast<size_t>(cbi);
+                block_size_ = static_cast<int>(bs);
+                memtable_flush_threshold_ = static_cast<int>(mft);
+                block_metric_ = static_cast<MetricType>(metric_val);
+                code_size = static_cast<size_t>(cs64);
+                code_size_ = code_size;
+                d_ = code_size / sizeof(float);
+                nlist = static_cast<size_t>(nlist64);
+
+                // Block num_vectors.
+                uint64_t n_blocks;
+                bifs.read(reinterpret_cast<char*>(&n_blocks), sizeof(uint64_t));
+                for (uint64_t i = 0; i < n_blocks; i++) {
+                    uint64_t bid, nv;
+                    bifs.read(reinterpret_cast<char*>(&bid), sizeof(uint64_t));
+                    bifs.read(reinterpret_cast<char*>(&nv), sizeof(uint64_t));
+                    block_num_vectors_[static_cast<size_t>(bid)] = static_cast<size_t>(nv);
+                }
+
+                // Block refcounts.
+                uint64_t n_refcounts;
+                bifs.read(reinterpret_cast<char*>(&n_refcounts), sizeof(uint64_t));
+                for (uint64_t i = 0; i < n_refcounts; i++) {
+                    uint64_t bid;
+                    int64_t rc;
+                    bifs.read(reinterpret_cast<char*>(&bid), sizeof(uint64_t));
+                    bifs.read(reinterpret_cast<char*>(&rc), sizeof(int64_t));
+                    block_refcount_[static_cast<size_t>(bid)] = static_cast<int>(rc);
+                }
+
+                // Block tombstones.
+                uint64_t n_ts_blocks;
+                bifs.read(reinterpret_cast<char*>(&n_ts_blocks), sizeof(uint64_t));
+                for (uint64_t i = 0; i < n_ts_blocks; i++) {
+                    uint64_t bid, n_ts;
+                    bifs.read(reinterpret_cast<char*>(&bid), sizeof(uint64_t));
+                    bifs.read(reinterpret_cast<char*>(&n_ts), sizeof(uint64_t));
+                    auto& ts_set = block_tombstones_[static_cast<size_t>(bid)];
+                    for (uint64_t j = 0; j < n_ts; j++) {
+                        idx_t id;
+                        bifs.read(reinterpret_cast<char*>(&id), sizeof(idx_t));
+                        ts_set.insert(id);
+                    }
+                }
+
+                // Partition→blocks mapping + memtable data.
+                uint64_t n_parts;
+                bifs.read(reinterpret_cast<char*>(&n_parts), sizeof(uint64_t));
+                size_t max_pid = 0;
+                for (uint64_t i = 0; i < n_parts; i++) {
+                    uint64_t pid64;
+                    bifs.read(reinterpret_cast<char*>(&pid64), sizeof(uint64_t));
+                    size_t pid = static_cast<size_t>(pid64);
+                    max_pid = std::max(max_pid, pid);
+
+                    uint64_t nb;
+                    bifs.read(reinterpret_cast<char*>(&nb), sizeof(uint64_t));
+                    auto& bids = partition_blocks_[pid];
+                    bids.resize(static_cast<size_t>(nb));
+                    for (uint64_t j = 0; j < nb; j++) {
+                        uint64_t bid;
+                        bifs.read(reinterpret_cast<char*>(&bid), sizeof(uint64_t));
+                        bids[j] = static_cast<size_t>(bid);
+                    }
+
+                    // Memtable data.
+                    uint64_t mt_nv;
+                    bifs.read(reinterpret_cast<char*>(&mt_nv), sizeof(uint64_t));
+                    if (mt_nv > 0) {
+                        size_t csize = static_cast<size_t>(mt_nv) * code_size;
+                        size_t isize = static_cast<size_t>(mt_nv) * sizeof(idx_t);
+                        uint8_t* codes = new uint8_t[csize];
+                        idx_t* ids = new idx_t[mt_nv];
+                        bifs.read(reinterpret_cast<char*>(codes), csize);
+                        bifs.read(reinterpret_cast<char*>(ids), isize);
+                        auto mt = std::make_unique<Memtable>();
+                        mt->data = std::make_shared<IndexPartition>(
+                            static_cast<int64_t>(mt_nv), codes, ids,
+                            static_cast<int64_t>(code_size));
+                        delete[] codes;
+                        delete[] ids;
+                        memtables_[pid] = std::move(mt);
+                    }
+                }
+                curr_list_id_ = std::max(curr_list_id_, static_cast<int>(max_pid + 1));
+
+                // Block vector data section (present when blocks were created offline).
+                if (bifs.peek() != EOF) {
+                    uint64_t n_data_blocks;
+                    bifs.read(reinterpret_cast<char*>(&n_data_blocks), sizeof(uint64_t));
+                    for (uint64_t i = 0; i < n_data_blocks; i++) {
+                        uint64_t bid, nv;
+                        bifs.read(reinterpret_cast<char*>(&bid), sizeof(uint64_t));
+                        bifs.read(reinterpret_cast<char*>(&nv), sizeof(uint64_t));
+                        if (nv > 0) {
+                            size_t csize = static_cast<size_t>(nv) * code_size;
+                            size_t isize = static_cast<size_t>(nv) * sizeof(idx_t);
+                            uint8_t* codes = new uint8_t[csize];
+                            idx_t* ids = new idx_t[nv];
+                            bifs.read(reinterpret_cast<char*>(codes), csize);
+                            bifs.read(reinterpret_cast<char*>(ids), isize);
+                            block_data_[static_cast<size_t>(bid)] =
+                                std::make_shared<IndexPartition>(
+                                    static_cast<int64_t>(nv), codes, ids,
+                                    static_cast<int64_t>(code_size));
+                            delete[] codes;
+                            delete[] ids;
+                        }
+                    }
+                }
+
+                bifs.close();
+                use_blocks_ = true;
+                // Clear s3_num_vectors_ since block mode doesn't use it.
+                s3_num_vectors_.clear();
+            }
 #else
             throw std::runtime_error(
                 "Quake was built without S3 support (QUAKE_USE_S3 not set).");
@@ -1023,6 +1962,17 @@ void DynamicInvertedLists::batch_update_entries(
     }
 
     Tensor DynamicInvertedLists::get_partition_ids() {
+        if (s3_mode_ && use_blocks_) {
+            // In block mode, partition IDs come from partition_blocks_ + memtable-only partitions.
+            std::set<size_t> pids;
+            for (auto& [pid, _] : partition_blocks_) pids.insert(pid);
+            for (auto& [pid, _] : memtables_) pids.insert(pid);
+            Tensor result = torch::empty({static_cast<int64_t>(pids.size())}, torch::kInt64);
+            auto acc = result.accessor<int64_t, 1>();
+            size_t i = 0;
+            for (size_t pid : pids) acc[i++] = static_cast<int64_t>(pid);
+            return result;
+        }
         // Return a 1D tensor of partition IDs
         Tensor result = torch::empty({(int64_t) partitions_.size()}, torch::kInt64);
         auto result_accessor = result.accessor<int64_t, 1>();

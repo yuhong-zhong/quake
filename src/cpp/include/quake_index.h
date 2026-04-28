@@ -133,7 +133,9 @@ public:
               int parent_n_workers = 0,
               const std::string &s3_bucket = "", const std::string &s3_prefix = "",
               const std::string &s3_region = "us-east-1",
-              const std::string &s3_endpoint = "");
+              const std::string &s3_endpoint = "",
+              int block_size = DEFAULT_BLOCK_SIZE,
+              int memtable_flush_threshold = DEFAULT_MEMTABLE_FLUSH_THRESHOLD);
 
     /**
      * @brief Get the total number of vectors in the index.
