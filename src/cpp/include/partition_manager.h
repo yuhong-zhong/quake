@@ -195,6 +195,13 @@ public:
               const string &s3_prefix = "",
               const string &s3_region = "us-east-1",
               const string &s3_endpoint = "");
+
+    /**
+     * @brief Initialize the LRU partition cache on the partition store.
+     * @param capacity             Max number of partitions to cache.
+     * @param eviction_threshold   Fraction of capacity at which eviction starts.
+     */
+    void init_cache(size_t capacity, float eviction_threshold = DEFAULT_CACHE_EVICTION_THRESHOLD);
 };
 
 

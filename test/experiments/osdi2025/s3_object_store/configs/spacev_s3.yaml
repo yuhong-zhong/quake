@@ -1,0 +1,71 @@
+# S3 Object Store Cost Simulation
+# Follows kick_the_tires / maintenance_ablation pattern
+seed: 9299
+mode: run
+name: spacev_s3_10m
+overwrite: True
+
+dataset:
+  name: spacev1b
+  path: /users/charlesx/SPTAG/datasets/SPACEV1B/vectors.bin
+  max_vectors: 10_000_000
+  metric: l2
+
+index:
+  nc: 1024
+  metric: l2
+  search:
+    k: 10
+    recall_target: 0.9
+    initial_search_fraction: 0.25
+
+# Each config is run independently; S3 costs compared at the end
+maintenance_configs:
+  - name: no_maintenance
+    do_maintenance: False
+
+  - name: query_cost
+    do_maintenance: True
+    delete_threshold: 10.0
+    split_threshold: 50.0
+    refinement_radius: 50
+    enable_delete_rejection: False
+
+  - name: size_based
+    do_maintenance: True
+    max_partition_size: 500000   # ~50 MB for 100-dim int8 vectors
+
+plot:
+  styles:
+    no_maintenance:
+      color: "#4E79A7"
+      marker: "o"
+    query_cost:
+      color: "#F28E2B"
+      marker: "s"
+    size_based:
+      color: "#59A14F"
+      marker: "^"
+
+workload:
+  insert_ratio: 0.4
+  delete_ratio: 0.1
+  query_ratio: 0.5
+  update_batch_size: 100000
+  query_batch_size: 100
+  number_of_operations: 200
+  initial_size: 1000000
+  cluster_size: 1000
+  cluster_sample_distribution: skewed
+
+# S3 simulation settings
+s3:
+  part_size: 8_000_000       # 8 MB multi-part threshold
+  # AWS S3 Standard pricing (us-east-1)
+  put_price_per_1k: 0.005
+  get_price_per_1k: 0.0004
+  storage_per_gb_month: 0.023
+  transfer_per_gb: 0.09
+
+results_dir: test/experiments/osdi2025/s3_object_store/results
+workload_dir: test/experiments/osdi2025/s3_object_store/workloads

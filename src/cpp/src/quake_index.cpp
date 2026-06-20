@@ -239,7 +239,8 @@ void QuakeIndex::save(const std::string& dir_path) {
 void QuakeIndex::load(const std::string& dir_path, int n_workers, bool use_numa,
                       int parent_n_workers,
                       const std::string& s3_bucket, const std::string& s3_prefix,
-                      const std::string& s3_region, const std::string& s3_endpoint) {
+                      const std::string& s3_region, const std::string& s3_endpoint,
+                      int cache_capacity) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) {
@@ -291,11 +292,17 @@ void QuakeIndex::load(const std::string& dir_path, int n_workers, bool use_numa,
             parent_ = nullptr;
         }
     }
-    // 4. Setup maintenance policy
+
+    // 4. Initialize LRU partition cache if requested.
+    if (cache_capacity > 0) {
+        partition_manager_->init_cache(static_cast<size_t>(cache_capacity));
+    }
+
+    // 5. Setup maintenance policy
     auto default_params = make_shared<MaintenancePolicyParams>();
     initialize_maintenance_policy(default_params);
 
-    // 5. Create query coordinator
+    // 6. Create query coordinator
     std::cout << "Loading coordinator with n_workers=" << n_workers << " and use_numa=" << use_numa << '\n';
     query_coordinator_ = std::make_shared<QueryCoordinator>(parent_, partition_manager_, maintenance_policy_, metric_, n_workers, use_numa);
     std::cout << "Loaded coordinator\n";

@@ -13,6 +13,7 @@
 #include <common.h>
 #include <faiss/invlists/InvertedLists.h>
 #include <index_partition.h>
+#include <lru_cache.h>
 
 #ifdef QUAKE_USE_S3
 #include <aws/core/Aws.h>
@@ -57,6 +58,20 @@ namespace faiss {
         /// Per-query S3 timing accumulators (reset by QueryCoordinator before each search).
         mutable std::atomic<int64_t> s3_load_time_ns_{0};
         mutable std::atomic<int64_t> n_s3_downloads_{0};
+
+        /// LRU partition cache (nullptr when caching is disabled).
+        std::shared_ptr<quake::CacheManager> cache_manager_;
+
+        /// Initialize the LRU partition cache.  Only valid when s3_mode_ is true.
+        /// @param capacity             Max number of partitions to cache.
+        /// @param eviction_threshold    Fraction of capacity at which eviction starts.
+        void init_cache(size_t capacity, float eviction_threshold = DEFAULT_CACHE_EVICTION_THRESHOLD);
+
+        /// Returns true when the LRU cache is active.
+        bool cache_enabled() const { return cache_manager_ != nullptr; }
+
+        /// Release (unpin) a partition after reading.  No-op when cache is disabled.
+        void release_partition(size_t list_no) const;
 
         /**
          * @brief Constructor for DynamicInvertedLists.

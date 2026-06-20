@@ -128,12 +128,14 @@ public:
      * @param s3_prefix       S3 key prefix for partition objects.
      * @param s3_region       AWS region (default: "us-east-1").
      * @param s3_endpoint     Optional custom endpoint URL (e.g. for MinIO).
+     * @param cache_capacity  Number of partitions to cache in memory (0 = disabled).
      */
     void load(const std::string &path, int n_workers = 0, bool use_numa = false,
               int parent_n_workers = 0,
               const std::string &s3_bucket = "", const std::string &s3_prefix = "",
               const std::string &s3_region = "us-east-1",
-              const std::string &s3_endpoint = "");
+              const std::string &s3_endpoint = "",
+              int cache_capacity = DEFAULT_CACHE_CAPACITY);
 
     /**
      * @brief Get the total number of vectors in the index.

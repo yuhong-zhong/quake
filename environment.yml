@@ -1,0 +1,13 @@
+name: quake-env
+channels:
+  - defaults
+dependencies:
+  - pytest
+  - numpy
+  - pandas[version='<3']
+  - python=3.11
+  - faiss-cpu
+  - pip
+  - matplotlib
+  - aws-sdk-cpp
+prefix: /opt/miniconda/envs/quake-env

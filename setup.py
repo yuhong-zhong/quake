@@ -34,7 +34,10 @@ class CMakeBuild(build_ext):
 
     def build_extension(self, ext):
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
-        cmake_args = ["-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + extdir, "-DPYTHON_EXECUTABLE=" + sys.executable]
+        cmake_args = ["-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + extdir,
+                      "-DPYTHON_EXECUTABLE=" + sys.executable,
+                      "-DPython3_EXECUTABLE=" + sys.executable,
+                      "-DPython_EXECUTABLE=" + sys.executable]
 
         cfg = "Debug" if self.debug else "Release"
         build_args = ["--config", cfg]
@@ -59,8 +62,9 @@ class CMakeBuild(build_ext):
             cmake_args += ["-DQUAKE_ENABLE_GPU=ON"]
         else:
             cmake_args += ["-DQUAKE_ENABLE_GPU=OFF", "-DTorch_NO_CUDA=ON", "-DTorch_USE_CUDA=OFF", "-DUSE_CUDA=OFF"]
-        # S3 support via aws-sdk-cpp (always enabled; SDK expected in CONDA_PREFIX)
-        cmake_args += ["-DQUAKE_USE_S3=ON"]
+        # S3 support via aws-sdk-cpp (opt-in; requires AWS SDK installed in CONDA_PREFIX)
+        use_s3 = os.environ.get("QUAKE_USE_S3", "0") == "1"
+        cmake_args += ["-DQUAKE_USE_S3=" + ("ON" if use_s3 else "OFF")]
         conda_prefix = os.environ.get("CONDA_PREFIX", "")
         if conda_prefix:
             cmake_args += ["-DCMAKE_PREFIX_PATH=" + conda_prefix]

@@ -1,0 +1,21 @@
+# S3 object-store simulation for inserting 100M vectors into Quake.
+# Set dataset.path to your SPACEV1B 100M subset file.
+
+dataset:
+  path: /users/charlesx/SPTAG/datasets/SPACEV1B/vectors.bin/vectors_merged.bin
+  format: sptag_int8                      # sptag_int8 | fbin | npy | pt
+  max_vectors: 100000000
+  offset: 0
+
+# Quake build parameters (used for initial build on first batch)
+build_params:
+  metric: l2
+  nlist: 4096
+  num_workers: 0
+  use_numa: false
+
+batching:
+  # If batch_vectors <= 0, it will be computed from batch_bytes and vector dim
+  batch_vectors: 0
+  batch_bytes: 536870912   # 512 MiB
+  part_size_bytes: 8388608 # 8 MiB

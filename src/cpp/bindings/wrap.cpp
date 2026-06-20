@@ -114,6 +114,7 @@ PYBIND11_MODULE(_bindings, m) {
              py::arg("parent_n_workers") = 0,
              py::arg("s3_bucket") = "", py::arg("s3_prefix") = "",
              py::arg("s3_region") = "us-east-1", py::arg("s3_endpoint") = "",
+             py::arg("cache_capacity") = DEFAULT_CACHE_CAPACITY,
              "Load an index from a specified path.\n\n"
              "Args:\n"
              "    path (str): The path from which to load the index.\n"
@@ -123,7 +124,8 @@ PYBIND11_MODULE(_bindings, m) {
              "    s3_bucket (str, optional): S3 bucket name; enables S3 mode when non-empty.\n"
              "    s3_prefix (str, optional): S3 key prefix for partition objects.\n"
              "    s3_region (str, optional): AWS region (default = 'us-east-1').\n"
-             "    s3_endpoint (str, optional): Custom S3 endpoint URL (e.g. MinIO).")
+             "    s3_endpoint (str, optional): Custom S3 endpoint URL (e.g. MinIO).\n"
+             "    cache_capacity (int, optional): Number of partitions to cache in memory (0 = disabled).")
         .def("ntotal", &QuakeIndex::ntotal,
              "Return the total number of vectors stored in the index.")
         .def("nlist", &QuakeIndex::nlist,
@@ -368,6 +370,10 @@ PYBIND11_MODULE(_bindings, m) {
             "Total S3 download time for this query in nanoseconds (S3 mode only).")
         .def_readwrite("n_s3_downloads", &SearchTimingInfo::n_s3_downloads,
             "Number of partitions downloaded from S3 for this query.")
+        .def_readwrite("cache_hits", &SearchTimingInfo::cache_hits,
+            "Number of cache hits for this query (cache mode only).")
+        .def_readwrite("cache_misses", &SearchTimingInfo::cache_misses,
+            "Number of cache misses for this query (cache mode only).")
          .def("__repr__", [](const SearchTimingInfo &s) {
              std::ostringstream oss;
              oss << "{";
@@ -382,7 +388,9 @@ PYBIND11_MODULE(_bindings, m) {
              }
              oss << "\"n_queries\": " << s.n_queries << ", ";
              oss << "\"n_clusters\": " << s.n_clusters << ", ";
-             oss << "\"partitions_scanned\": " << s.partitions_scanned;
+             oss << "\"partitions_scanned\": " << s.partitions_scanned << ", ";
+             oss << "\"cache_hits\": " << s.cache_hits << ", ";
+             oss << "\"cache_misses\": " << s.cache_misses;
              oss << "}";
              return oss.str();
          });

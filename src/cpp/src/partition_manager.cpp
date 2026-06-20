@@ -792,3 +792,10 @@ void PartitionManager::load(const string &path,
         std::cout << "[PartitionManager] load: Load complete." << std::endl;
     }
 }
+
+void PartitionManager::init_cache(size_t capacity, float eviction_threshold) {
+    if (!partition_store_) {
+        throw runtime_error("[PartitionManager] init_cache: partition_store_ is null.");
+    }
+    partition_store_->init_cache(capacity, eviction_threshold);
+}

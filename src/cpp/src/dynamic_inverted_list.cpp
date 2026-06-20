@@ -114,6 +114,16 @@ namespace faiss {
             auto pit = partitions_.find(list_no);
             if (pit != partitions_.end()) return pit->second->codes_;
 
+            // If LRU cache is enabled, use it instead of temp_s3_.
+            if (cache_manager_) {
+                auto entry = cache_manager_->get(list_no);
+                if (entry && entry->partition_data) {
+                    return entry->partition_data->codes_;
+                }
+                throw std::runtime_error("Cache failed to load partition " +
+                                         std::to_string(list_no));
+            }
+
             std::lock_guard<std::mutex> lk(temp_s3_mutex_);
             if (!temp_s3_.count(list_no)) {
                 auto t0 = high_resolution_clock::now();
@@ -138,6 +148,18 @@ namespace faiss {
             // Check partitions_ first: mutations materialize there temporarily.
             auto pit = partitions_.find(list_no);
             if (pit != partitions_.end()) return pit->second->ids_;
+
+            // If LRU cache is enabled, use it (partition was already pinned by get_codes).
+            if (cache_manager_) {
+                auto entry = cache_manager_->get(list_no);
+                if (entry && entry->partition_data) {
+                    // This second get() increments pin_count again; the caller
+                    // must call release_partition() once for the codes+ids pair.
+                    return entry->partition_data->ids_;
+                }
+                throw std::runtime_error("Cache failed to load partition " +
+                                         std::to_string(list_no));
+            }
 
             std::lock_guard<std::mutex> lk(temp_s3_mutex_);
             // get_codes() must have been called first for this partition
@@ -195,6 +217,13 @@ namespace faiss {
 
     void DynamicInvertedLists::prefetch_partitions(const std::vector<size_t>& pids) const {
         if (!s3_mode_ || pids.empty()) return;
+
+        // If LRU cache is enabled, delegate entirely to it.
+        if (cache_manager_) {
+            cache_manager_->prefetch(pids);
+            return;
+        }
+
 #ifdef QUAKE_USE_S3
         // Filter to partitions not yet cached.
         std::vector<size_t> to_fetch;
@@ -355,7 +384,11 @@ namespace faiss {
     }
 
     void DynamicInvertedLists::ensure_partition_loaded(size_t pid) {
-        if (s3_mode_) s3_ensure_partition_loaded(pid);
+        if (s3_mode_) {
+            // Invalidate cached entry before mutating — we'll re-upload after.
+            if (cache_manager_) cache_manager_->invalidate(pid);
+            s3_ensure_partition_loaded(pid);
+        }
     }
 
     void DynamicInvertedLists::flush_partition(size_t pid) {
@@ -363,7 +396,39 @@ namespace faiss {
     }
 
     void DynamicInvertedLists::evict_partition(size_t pid) {
-        if (s3_mode_) s3_evict_partition(pid);
+        if (s3_mode_) {
+            // Also invalidate the cache entry so stale data isn't served.
+            if (cache_manager_) cache_manager_->invalidate(pid);
+            s3_evict_partition(pid);
+        }
+    }
+
+    void DynamicInvertedLists::release_partition(size_t list_no) const {
+        if (cache_manager_) {
+            // Unpin twice: once for get_codes(), once for get_ids().
+            cache_manager_->release(list_no);
+            cache_manager_->release(list_no);
+        }
+    }
+
+    void DynamicInvertedLists::init_cache(size_t capacity, float eviction_threshold) {
+        if (!s3_mode_) {
+            std::cerr << "[DynamicInvertedLists::init_cache] Cache only supported in S3 mode." << std::endl;
+            return;
+        }
+#ifdef QUAKE_USE_S3
+        auto datastore = std::make_shared<quake::S3DataStore>(
+            s3_client_, s3_bucket_, s3_prefix_,
+            static_cast<int64_t>(code_size), s3_num_vectors_);
+        cache_manager_ = std::make_shared<quake::CacheManager>(
+            capacity, eviction_threshold, datastore);
+        cache_manager_->start();
+        std::cout << "[DynamicInvertedLists] LRU cache initialized: capacity="
+                  << capacity << ", eviction_threshold=" << eviction_threshold
+                  << std::endl;
+#else
+        throw std::runtime_error("Quake was built without S3 support (QUAKE_USE_S3 not set).");
+#endif
     }
 
     // ────────────────────────────────────────────────────────────────────────

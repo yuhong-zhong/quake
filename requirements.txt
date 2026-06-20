@@ -1,0 +1,98 @@
+absl-py==2.4.0
+alabaster==1.0.0
+astunparse==1.6.3
+babel==2.18.0
+boto3==1.42.84
+botocore==1.42.84
+Bottleneck @ file:///home/task_176193795831906/conda-bld/bottleneck_1761938007449/work
+certifi==2026.2.25
+charset-normalizer==3.4.6
+contourpy @ file:///home/task_176364362873675/conda-bld/contourpy_1763643921742/work
+cycler @ file:///home/task_176606789349323/croot/cycler_1766067915143/work
+diskannpy==0.7.0
+docutils==0.22.4
+faiss==1.13.2
+faiss-cpu==1.7.4
+filelock==3.25.2
+flatbuffers==25.12.19
+fonttools @ file:///home/task_177425656280479/croot/fonttools_1774256591101/work
+fsspec==2026.2.0
+gast==0.7.0
+google-pasta==0.2.0
+graphviz==0.21
+grpcio==1.78.0
+h5py==3.16.0
+idna==3.11
+imagesize==2.0.0
+iniconfig @ file:///home/task_176735680440987/croot/iniconfig_1767356866218/work
+Jinja2==3.1.6
+jmespath==1.1.0
+joblib==1.5.3
+keras==3.13.2
+kiwisolver @ file:///home/task_176415926903268/conda-bld/kiwisolver_1764159297481/work
+libclang==18.1.1
+lightgbm==4.6.0
+Markdown==3.10.2
+markdown-it-py==4.0.0
+MarkupSafe==3.0.3
+matplotlib==3.10.8
+mdurl==0.1.2
+ml-dtypes==0.3.2
+mpmath==1.3.0
+namex==0.1.0
+networkx==3.6.1
+numexpr @ file:///home/task_176216560327529/conda-bld/numexpr_1762165677686/work
+numpy==1.25.0
+opt_einsum==3.4.0
+optree==0.19.0
+packaging @ file:///home/task_176104885106445/conda-bld/packaging_1761049078006/work
+pandas @ file:///home/task_176233228033452/conda-bld/pandas_1762332325070/work/dist/pandas-2.3.3-cp311-cp311-linux_x86_64.whl#sha256=920644f9267829793147d85d419f7e25d0fb8c679dd7fa07f7532a94488a1690
+pillow @ file:///home/task_177247536631345/croot/pillow_1772475405729/work
+pluggy @ file:///croot/pluggy_1733169602837/work
+protobuf==4.25.8
+Pygments @ file:///home/task_176243133773609/conda-bld/pygments_1762431407413/work
+pyparsing @ file:///home/task_176397386651997/conda-bld/pyparsing_1763973878368/work
+PyQt6==6.10.2
+PyQt6_sip @ file:///home/task_177247745174562/croot/pyqt-split_1772477486006/work/pyqt_sip
+pytest @ file:///home/task_176978722924365/croot/pytest_1769787672032/work
+python-dateutil @ file:///croot/python-dateutil_1716495738603/work
+pytz @ file:///home/task_177304300567355/croot/pytz_1773043043761/work
+PyYAML==6.0.3
+-e git+https://github.com/Char15Xu/quake.git@136f8ea979e74db03ef84bfa1348fb61788171d4#egg=quake
+requests==2.32.5
+rich==14.3.3
+roman-numerals==4.1.0
+s3transfer==0.16.0
+scann==1.3.2
+scikit-learn==1.8.0
+scipy==1.17.1
+sip @ file:///home/task_177080690330752/croot/sip_1770807534460/work
+six @ file:///croot/six_1744271502820/work
+snowballstemmer==3.0.1
+Sphinx==9.0.4
+sphinx_rtd_theme==3.1.0
+sphinxcontrib-applehelp==2.0.0
+sphinxcontrib-devhelp==2.0.0
+sphinxcontrib-htmlhelp==2.1.0
+sphinxcontrib-jquery==4.1
+sphinxcontrib-jsmath==1.0.1
+sphinxcontrib-mermaid==2.0.1
+sphinxcontrib-qthelp==2.0.0
+sphinxcontrib-serializinghtml==2.0.0
+sympy==1.14.0
+tabulate==0.10.0
+tensorboard==2.16.2
+tensorboard-data-server==0.7.2
+tensorflow==2.16.2
+tensorflow-io-gcs-filesystem==0.37.1
+termcolor==3.3.0
+threadpoolctl==3.6.0
+torch==2.11.0+cpu
+torchaudio==2.11.0+cpu
+torchvision==0.26.0+cpu
+tornado @ file:///home/task_177430341552759/croot/tornado_1774303628185/work
+typing_extensions==4.15.0
+tzdata @ file:///home/task_176829656558347/croot/python-tzdata_1768296637279/work
+urllib3==2.6.3
+Werkzeug==3.1.7
+wrapt==2.1.2

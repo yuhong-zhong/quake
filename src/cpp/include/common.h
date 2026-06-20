@@ -78,6 +78,10 @@ constexpr int DEFAULT_APS_FLUSH_PERIOD_US = 5;         ///< Default period (in m
 constexpr int DEFAULT_S3_PREFETCH_INITIAL = 1;         ///< Default number of S3 partitions to download in parallel before scanning starts.
 constexpr int DEFAULT_S3_PREFETCH_LOOKAHEAD = 1;       ///< Default number of S3 partitions to download in parallel per subsequent batch.
 
+// Default constants for LRU partition cache
+constexpr int DEFAULT_CACHE_CAPACITY = 0;              ///< Default cache capacity in number of partitions (0 = disabled).
+constexpr float DEFAULT_CACHE_EVICTION_THRESHOLD = 0.9f; ///< Default fraction of capacity at which eviction triggers.
+
 // Default constants for maintenance policy parameters
 constexpr const char* DEFAULT_MAINTENANCE_POLICY = "query_cost"; ///< Default maintenance policy type.
 constexpr int DEFAULT_WINDOW_SIZE = 1000;              ///< Default window size for measuring hit rates.
@@ -256,6 +260,10 @@ struct SearchTimingInfo {
     // S3 stats (populated only when index is in S3 mode)
     int64_t s3_load_time_ns = 0; ///< Total S3 download time for this query (ns).
     int64_t n_s3_downloads = 0;  ///< Number of partitions downloaded from S3.
+
+    // LRU cache stats (populated only when cache is enabled)
+    int64_t cache_hits = 0;      ///< Number of cache hits for this query.
+    int64_t cache_misses = 0;    ///< Number of cache misses for this query.
 };
 
 /**

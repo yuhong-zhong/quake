@@ -195,17 +195,22 @@ void QueryCoordinator::handle_nonbatched_job(const ScanJob &job,
                   *buf,
                   metric_);
 
+        // Release the partition after scanning (unpin from LRU cache).
+        partition_manager_->partition_store_->release_partition(static_cast<size_t>(job.partition_id));
+
         // If scan_list completes, enqueue its results
         auto tv = buf->get_topk();
         auto ti = buf->get_topk_indices();
         result_queue_.enqueue(ResultJob{job.query_id, job.rank, std::move(tv), std::move(ti)});
 
     } catch (const std::exception& e) {
+        partition_manager_->partition_store_->release_partition(static_cast<size_t>(job.partition_id));
         std::cerr << "[QueryCoordinator::handle_nonbatched_job] Exception during scan for partition "
                   << job.partition_id << ", query " << job.query_id << ": " << e.what()
                   << ". Enqueuing empty result.\n";
         result_queue_.enqueue(ResultJob{job.query_id, job.rank, {}, {}}); // Enqueue empty result on error
     } catch (...) {
+        partition_manager_->partition_store_->release_partition(static_cast<size_t>(job.partition_id));
         std::cerr << "[QueryCoordinator::handle_nonbatched_job] Unknown exception during scan for partition "
                   << job.partition_id << ", query " << job.query_id
                   << ". Enqueuing empty result.\n";
@@ -335,6 +340,9 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
                 results_batch.size()
         );
     }
+
+    // Release the partition after all sub-batches are scanned (unpin from LRU cache).
+    partition_manager_->partition_store_->release_partition(static_cast<size_t>(job.partition_id));
 }
 
 void QueryCoordinator::init_global_buffers(int64_t nQ,
@@ -857,6 +865,10 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
                       dimension,
                       *topk_buf,
                       metric_);
+
+            // Release the partition after scanning (unpin from LRU cache).
+            partition_manager_->partition_store_->release_partition(static_cast<size_t>(pi));
+
             scanned_ids.push_back(pi);
 
             float curr_radius = topk_buf->get_kth_distance();
@@ -1005,7 +1017,7 @@ shared_ptr<SearchResult> QueryCoordinator::search(Tensor x, shared_ptr<SearchPar
     // Reset S3 per-query counters and clear any stale temp partitions
     partition_manager_->partition_store_->s3_load_time_ns_.store(0, std::memory_order_relaxed);
     partition_manager_->partition_store_->n_s3_downloads_.store(0, std::memory_order_relaxed);
-    {
+    if (!partition_manager_->partition_store_->cache_enabled()) {
         std::lock_guard<std::mutex> lk(partition_manager_->partition_store_->temp_s3_mutex_);
         partition_manager_->partition_store_->temp_s3_.clear();
     }
@@ -1016,9 +1028,19 @@ shared_ptr<SearchResult> QueryCoordinator::search(Tensor x, shared_ptr<SearchPar
     // Copy S3 stats into timing_info and release temp partitions
     search_result->timing_info->s3_load_time_ns = partition_manager_->partition_store_->s3_load_time_ns_.load(std::memory_order_relaxed);
     search_result->timing_info->n_s3_downloads  = partition_manager_->partition_store_->n_s3_downloads_.load(std::memory_order_relaxed);
-    {
+    if (!partition_manager_->partition_store_->cache_enabled()) {
         std::lock_guard<std::mutex> lk(partition_manager_->partition_store_->temp_s3_mutex_);
         partition_manager_->partition_store_->temp_s3_.clear();
+    }
+
+    // Copy cache stats if cache is enabled.
+    if (partition_manager_->partition_store_->cache_enabled()) {
+        auto& cs = partition_manager_->partition_store_->cache_manager_->stats();
+        search_result->timing_info->cache_hits = cs.hits.load(std::memory_order_relaxed);
+        search_result->timing_info->cache_misses = cs.misses.load(std::memory_order_relaxed);
+        // Also report S3 timing from the cache manager (async downloads).
+        search_result->timing_info->s3_load_time_ns += cs.s3_load_time_ns.load(std::memory_order_relaxed);
+        search_result->timing_info->n_s3_downloads  += cs.n_s3_downloads.load(std::memory_order_relaxed);
     }
 
     auto end = high_resolution_clock::now();
@@ -1126,6 +1148,9 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
                           d,
                           local_buffers,
                           metric_);
+
+        // Release the partition after scanning (unpin from LRU cache).
+        partition_manager_->partition_store_->release_partition(static_cast<size_t>(pid));
 
         // Merge the local results into the corresponding global buffers.
         for (int i = 0; i < batch_size; i++) {
